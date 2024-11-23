@@ -8,231 +8,222 @@ import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
+import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
-// A CSMM is a pricing curve that follows the invariant `x + y = k`
-// instead of the invariant `x * y = k`
 
-// This is theoretically the ideal curve for a stablecoin or pegged pairs (stETH/ETH)
-// In practice, we don't usually see this in prod since depegs can happen and we dont want exact equal amounts
-// But is a nice little NoOp hook example
 
-contract CSMM is BaseHook {
+contract LimitOrderHook is BaseHook {
     using CurrencySettler for Currency;
 
-    error AddLiquidityThroughHook();
 
-    struct CallbackData {
-        uint256 amountEach;
-        Currency currency0;
-        Currency currency1;
-        address sender;
+    // Struct to represent a limit order
+    struct LimitOrder {
+        address recipient;      // Who receives the filled order
+        bool isToken0;         // Whether the input token is token0
+        bool isRange;          // Whether this is a range order or single-tick limit order
+        int24 targetTick;      // Target tick for single-tick limit orders
+        uint256 amount;        // Amount of input token
+        uint128 liquidity;     // Liquidity amount
+        int24 bottomTick;      // Bottom tick for range orders
+        int24 topTick;         // Top tick for range orders
+        bool executed;         // Whether the order has been executed 
     }
+
+    struct VirtualPool {
+        // Mirror of all pool liquidity
+        mapping(int24 => uint128) liquidityPerTick;
+
+        // Additional state for limit orders
+        mapping(bytes32 => LimitOrder) limitOrders;
+
+        // Track which ticks have limit orders using EnumerableSet
+        EnumerableSet.Int24Set limitOrderTicks; 
+        // Current virtual price (might differ from real pool after executions)
+        int24 currentTick;
+    }
+
+    mapping(bytes32 => VirtualPool) public virtualPools;
 
     constructor(IPoolManager poolManager) BaseHook(poolManager) {}
 
-    function getHookPermissions()
-        public
-        pure
-        override
-        returns (Hooks.Permissions memory)
-    {
-        return
-            Hooks.Permissions({
-                beforeInitialize: false,
-                afterInitialize: false,
-                beforeAddLiquidity: true, // Don't allow adding liquidity normally
-                afterAddLiquidity: false,
-                beforeRemoveLiquidity: false,
-                afterRemoveLiquidity: false,
-                beforeSwap: true, // Override how swaps are done
-                afterSwap: false,
-                beforeDonate: false,
-                afterDonate: false,
-                beforeSwapReturnDelta: true, // Allow beforeSwap to return a custom delta
-                afterSwapReturnDelta: false,
-                afterAddLiquidityReturnDelta: false,
-                afterRemoveLiquidityReturnDelta: false
-            });
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: false,
+            beforeAddLiquidity: true,  // We want to intercept all liquidity adds
+            afterAddLiquidity: false,
+            beforeRemoveLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: false,
+            afterSwap: false,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: true,  // Adjust swap outputs here
+            afterAddLiquidityReturnDelta: false, 
+            afterRemoveLiquidityReturnDelta: true // Adjust removal amounts based on execution state
+        });
     }
 
-    // Disable adding liquidity through the PM
+    // Intercept all liquidity adds to mirror in virtual pool
     function beforeAddLiquidity(
-        address,
-        PoolKey calldata,
-        IPoolManager.ModifyLiquidityParams calldata,
-        bytes calldata
-    ) external pure override returns (bytes4) {
-        revert AddLiquidityThroughHook();
-    }
-
-    // Custom add liquidity function
-    function addLiquidity(PoolKey calldata key, uint256 amountEach) external {
-        poolManager.unlock(
-            abi.encode(
-                CallbackData(
-                    amountEach,
-                    key.currency0,
-                    key.currency1,
-                    msg.sender
-                )
-            )
-        );
-    }
-
-    function _unlockCallback(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata data
-    ) internal override returns (bytes memory) {
-        CallbackData memory callbackData = abi.decode(data, (CallbackData));
+    ) external override returns (bytes4) {
+        bytes32 poolId = keccak256(abi.encode(key));
+        VirtualPool storage vPool = virtualPools[poolId];
+        
+        // Mirror liquidity in virtual pool
+        vPool.totalLiquidityPerTick[params.tickLower] += uint128(params.liquidityDelta);
+        vPool.totalLiquidityPerTick[params.tickUpper] += uint128(params.liquidityDelta);
 
-        // Settle `amountEach` of each currency from the sender
-        // i.e. Create a debit of `amountEach` of each currency with the Pool Manager
-        callbackData.currency0.settle(
-            poolManager,
-            callbackData.sender,
-            callbackData.amountEach,
-            false // `burn` = `false` i.e. we're actually transferring tokens, not burning ERC-6909 Claim Tokens
-        );
-        callbackData.currency1.settle(
-            poolManager,
-            callbackData.sender,
-            callbackData.amountEach,
-            false
-        );
+        // If this is a limit order, track additional info
+        if (data.length > 0) {
+            (bool isLimitOrder, int24 targetTick, bool isRange, int24 bottomTick, int24 topTick) = 
+                abi.decode(data, (bool, int24, bool, int24, int24));
+            
+            if (isLimitOrder) {
+                bytes32 orderId = keccak256(abi.encode(sender, block.timestamp, params));
+                vPool.limitOrders[orderId] = LimitOrder({
+                    recipient: sender,
+                    isToken0: params.tickLower < vPool.currentTick,
+                    isRange: isRange,
+                    targetTick: targetTick,
+                    amount: 0, // Will be set after add liquidity
+                    liquidity: uint128(params.liquidityDelta),
+                    bottomTick: bottomTick,
+                    topTick: topTick,
+                    executed: false
+                });
 
-        // Since we didn't go through the regular "modify liquidity" flow,
-        // the PM just has a debit of `amountEach` of each currency from us
-        // We can, in exchange, get back ERC-6909 claim tokens for `amountEach` of each currency
-        // to create a credit of `amountEach` of each currency to us
-        // that balances out the debit
+                if (isRange) {
+                    vPool.isLimitOrderTick[bottomTick] = true;
+                    vPool.isLimitOrderTick[topTick] = true;
+                } else {
+                    vPool.isLimitOrderTick[targetTick] = true;
+                }
+            }
+        }
 
-        // We will store those claim tokens with the hook, so when swaps take place
-        // liquidity from our CSMM can be used by minting/burning claim tokens the hook owns
-        callbackData.currency0.take(
-            poolManager,
-            address(this),
-            callbackData.amountEach,
-            true // true = mint claim tokens for the hook, equivalent to money we just deposited to the PM
-        );
-        callbackData.currency1.take(
-            poolManager,
-            address(this),
-            callbackData.amountEach,
-            true
-        );
-
-        return "";
+        return BaseHook.beforeAddLiquidity.selector;
     }
 
-    // Swapping
-    function beforeSwap(
+    function afterSwapReturnDelta(
         address,
         PoolKey calldata key,
         IPoolManager.SwapParams calldata params,
+        BalanceDelta realDelta,
         bytes calldata
-    ) external override returns (bytes4, BeforeSwapDelta, uint24) {
-        uint256 amountInOutPositive = params.amountSpecified > 0
-            ? uint256(params.amountSpecified)
-            : uint256(-params.amountSpecified);
+    ) external override returns (BalanceDelta) {
+        bytes32 poolId = keccak256(abi.encode(key));
+        VirtualPool storage vPool = virtualPools[poolId];
 
-        /**
-        BalanceDelta is a packed value of (currency0Amount, currency1Amount)
-
-        BeforeSwapDelta varies such that it is not sorted by token0 and token1
-        Instead, it is sorted by "specifiedCurrency" and "unspecifiedCurrency"
-
-        Specified Currency => The currency in which the user is specifying the amount they're swapping for
-        Unspecified Currency => The other currency
-
-        For example, in an ETH/USDC pool, there are 4 possible swap cases:
-
-        1. ETH for USDC with Exact Input for Output (amountSpecified = negative value representing ETH)
-        2. ETH for USDC with Exact Output for Input (amountSpecified = positive value representing USDC)
-        3. USDC for ETH with Exact Input for Output (amountSpecified = negative value representing USDC)
-        4. USDC for ETH with Exact Output for Input (amountSpecified = positive value representing ETH)
-
-        In Case (1):
-            -> the user is specifying their swap amount in terms of ETH, so the specifiedCurrency is ETH
-            -> the unspecifiedCurrency is USDC
-
-        In Case (2):
-            -> the user is specifying their swap amount in terms of USDC, so the specifiedCurrency is USDC
-            -> the unspecifiedCurrency is ETH
-
-        In Case (3):
-            -> the user is specifying their swap amount in terms of USDC, so the specifiedCurrency is USDC
-            -> the unspecifiedCurrency is ETH
-
-        In Case (4):
-            -> the user is specifying their swap amount in terms of ETH, so the specifiedCurrency is ETH
-            -> the unspecifiedCurrency is USDC
-    
-        -------
+        // Store old tick for checking crossed limit orders
+        int24 oldTick = vPool.currentTick;
         
-        Assume zeroForOne = true (without loss of generality)
-        Assume abs(amountSpecified) = 100
-
-        For an exact input swap where amountSpecified is negative (-100)
-            -> specified token = token0
-            -> unspecified token = token1
-            -> we set deltaSpecified = -(-100) = 100
-            -> we set deltaUnspecified = -100
-            -> i.e. hook is owed 100 specified token (token0) by PM (that comes from the user)
-            -> and hook owes 100 unspecified token (token1) to PM (to go to the user)
-    
-        For an exact output swap where amountSpecified is positive (100)
-            -> specified token = token1
-            -> unspecified token = token0
-            -> we set deltaSpecified = -100
-            -> we set deltaUnspecified = 100
-            -> i.e. hook owes 100 specified token (token1) to PM (to go to the user)
-            -> and hook is owed 100 unspecified token (token0) by PM (that comes from the user)
-
-        In either case, we can design BeforeSwapDelta as (-params.amountSpecified, params.amountSpecified)
-    
-    */
-
-        BeforeSwapDelta beforeSwapDelta = toBeforeSwapDelta(
-            int128(-params.amountSpecified), // So `specifiedAmount` = +100
-            int128(params.amountSpecified) // Unspecified amount (output delta) = -100
+        // Execute swap in virtual pool and get virtual amounts
+        (int256 virtualAmount0, int256 virtualAmount1) = executeVirtualSwap(
+            vPool,
+            params,
+            oldTick,
+            realDelta
         );
 
-        if (params.zeroForOne) {
-            // If user is selling Token 0 and buying Token 1
+        // Return difference between virtual and real amounts
+        return BalanceDelta.wrap(
+            virtualAmount0 - realDelta.amount0(),
+            virtualAmount1 - realDelta.amount1()
+        );
+    }
 
-            // They will be sending Token 0 to the PM, creating a debit of Token 0 in the PM
-            // We will take claim tokens for that Token 0 from the PM and keep it in the hook
-            // and create an equivalent credit for that Token 0 since it is ours!
-            key.currency0.take(
-                poolManager,
-                address(this),
-                amountInOutPositive,
-                true
-            );
+    function executeVirtualSwap(
+        VirtualPool storage vPool,
+        IPoolManager.SwapParams calldata params,
+        int24 oldTick,
+        BalanceDelta realDelta
+    ) internal returns (int256 virtualAmount0, int256 virtualAmount1) {
+        vPool.currentTick = computeNewTick(params, realDelta);
+        
+        // Get range of ticks to check
+        int24 startTick = params.zeroForOne ? oldTick : vPool.currentTick;
+        int24 endTick = params.zeroForOne ? vPool.currentTick : oldTick;
+        
+        // Use EnumerableSet to efficiently find relevant ticks
+        uint256 length = vPool.limitOrderTicks.length();
+        for (uint256 i = 0; i < length; ) {
+            int24 tick = vPool.limitOrderTicks.at(i);
+            
+            // Check if tick is in our range
+            if (tick >= startTick && tick <= endTick) {
+                executeOrdersAtTick(vPool, tick);
+                // Optional: remove tick if all orders executed
+                if (allOrdersExecutedAtTick(vPool, tick)) {
+                    vPool.limitOrderTicks.remove(tick);
+                    // Don't increment i since we removed an element
+                    continue;
+                }
+            }
+            unchecked { ++i; }
+        }
+        
+        return calculateVirtualSwapAmounts(vPool, params, realDelta);
+    }
 
-            // They will be receiving Token 1 from the PM, creating a credit of Token 1 in the PM
-            // We will burn claim tokens for Token 1 from the hook so PM can pay the user
-            // and create an equivalent debit for Token 1 since it is ours!
-            key.currency1.settle(
-                poolManager,
-                address(this),
-                amountInOutPositive,
-                true
-            );
-        } else {
-            key.currency0.settle(
-                poolManager,
-                address(this),
-                amountInOutPositive,
-                true
-            );
-            key.currency1.take(
-                poolManager,
-                address(this),
-                amountInOutPositive,
-                true
-            );
+    function afterRemoveLiquidityReturnDelta(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta realDelta,
+        bytes calldata hookData
+    ) external override returns (BalanceDelta) {
+        bytes32 poolId = keccak256(abi.encode(key));
+        VirtualPool storage vPool = virtualPools[poolId];
+        
+        // Update virtual pool total liquidity
+        vPool.totalLiquidityPerTick[params.tickLower] -= uint128(params.liquidityDelta);
+        vPool.totalLiquidityPerTick[params.tickUpper] -= uint128(params.liquidityDelta);
+
+        // If this is a limit order, calculate based on execution state
+        if (hookData.length > 0) {
+            bytes32 orderId = abi.decode(hookData, (bytes32));
+            LimitOrder storage order = vPool.limitOrders[orderId];
+            
+            if (order.executed) {
+                // Calculate amounts as if executed at target price
+                (int256 virtualAmount0, int256 virtualAmount1) = 
+                    calculateExecutedAmounts(order, uint128(-params.liquidityDelta));
+                
+                return BalanceDelta.wrap(
+                    virtualAmount0 - realDelta.amount0(),
+                    virtualAmount1 - realDelta.amount1()
+                );
+            }
         }
 
-        return (this.beforeSwap.selector, beforeSwapDelta, 0);
+        return BalanceDelta.wrap(0, 0);
     }
+
+    function placeLimitOrder(...) {
+        // ... other logic ...
+        
+        // Add to EnumerableSet instead of mapping
+        if (isRange) {
+            vPool.limitOrderTicks.add(bottomTick);
+            vPool.limitOrderTicks.add(topTick);
+        } else {
+            vPool.limitOrderTicks.add(targetTick);
+        }
+    }
+    // Helper functions to implement:
+    // - computeNewTick()
+    // - executeOrdersAtTick()
+    // - calculateVirtualSwapAmounts()
+    // - calculateExecutedAmounts()
 }
+
+
+
+
+
