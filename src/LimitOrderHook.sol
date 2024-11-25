@@ -7,13 +7,13 @@ import {Currency} from "v4-core/types/Currency.sol";
 import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
-import {IERC6909Claims} from "v4-core/src/interfaces/external/IERC6909Claims.sol";
+import {IERC6909Claims} from "v4-core/interfaces/external/IERC6909Claims.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 
 
 contract LimitOrderHook is BaseHook, IERC6909Claims {
-    using EnumerableSet for EnumerableSet.Int24Set;
+    using EnumerableSet for EnumerableSet.UintSet;
     using CurrencySettler for Currency;
 
 
@@ -37,6 +37,10 @@ contract LimitOrderHook is BaseHook, IERC6909Claims {
     bytes32 constant PREVIOUS_TICK_SLOT = keccak256("uniswap.hooks.limitorder.previous-tick");
     
     // Add the new allowance mapping required by IERC6909Claims
+    // first address:  This is the token owner's address
+    // second address:  This is the spender's address (who is allowed to spend)
+    // uint256:  This is the tokenID
+    // uint 256: This is the amount allowed to spend
     mapping(address => mapping(address => mapping(uint256 => uint256))) private _allowances;
 
 
@@ -48,13 +52,16 @@ contract LimitOrderHook is BaseHook, IERC6909Claims {
     mapping(bytes32 => LimitOrder) public limitOrders;
     
     // Track which ticks have limit orders
-    mapping(bytes32 => EnumerableSet.Int24Set) private poolTicks;
+    mapping(bytes32 => EnumerableSet.UintSet) private poolTicks;
 
-    // ERC-6909 claim tokens
-    mapping(address => mapping(uint256 => uint256)) public balanceOf;
-    mapping(address => mapping(address => bool)) public isOperator;
 
     uint256 public constant CLAIM_TOKEN_ID = 1;
+
+    // Required events from IERC6909Claims
+    event Transfer(address caller, address indexed from, address indexed to, uint256 indexed id, uint256 amount);
+    event Approval(address indexed owner, address indexed spender, uint256 indexed id, uint256 amount);
+    event OperatorSet(address indexed owner, address indexed operator, bool approved);
+    event LimitOrderExecuted(bytes32 indexed orderId, address indexed owner, uint256 amount0, uint256 amount1);
 
     constructor(IPoolManager poolManager) BaseHook(poolManager) {}
 
@@ -114,7 +121,7 @@ contract LimitOrderHook is BaseHook, IERC6909Claims {
         // Check all ticks in range for limit orders
         uint256 length = poolTicks[poolId].length();
         for (uint256 i = 0; i < length;) {
-            int24 tick = poolTicks[poolId].length();
+            int24 tick = int24(int256(poolTicks[poolId].at(i)));
 
             if (tick >= startTick && tick <= endTick) {
                 // Execute orders at this tick
@@ -159,6 +166,13 @@ contract LimitOrderHook is BaseHook, IERC6909Claims {
         order.executed = true;
     }
 
+    function _addTickToPool(bytes32 poolId, int24 tick) internal returns (bool) {
+        return poolTicks[poolId].add(uint256(int256(tick)));
+    }
+
+    function _removeTickFromPool(bytes32 poolId, int24 tick) internal returns (bool) {
+        return poolTicks[poolId].remove(uint256(int256(tick)));
+    }
     // ERC-6909 functions
 
     // Add required function from IERC6909Claims
@@ -206,11 +220,7 @@ contract LimitOrderHook is BaseHook, IERC6909Claims {
         emit Transfer(msg.sender, sender, receiver, id, amount);
         return true;
     }
-    
-    // Add required events from IERC6909Claims
-    event Transfer(address caller, address indexed from, address indexed to, uint256 indexed id, uint256 amount);
-    event Approval(address indexed owner, address indexed spender, uint256 indexed id, uint256 amount);
-    event OperatorSet(address indexed owner, address indexed operator, bool approved);
+
 
     // Function to claim executed limit orders
     function claimLimitOrder(bytes32 orderId) external {
@@ -227,13 +237,7 @@ contract LimitOrderHook is BaseHook, IERC6909Claims {
         // Implement actual token transfer logic
     } 
 
-    event LimitOrderExecuted(
-        bytes32 indexed orderId,
-        address indexed owner,
-        uint256 amount0,
-        uint256 amount1
-    );
-    
+
 }
 
 
