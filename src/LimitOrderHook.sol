@@ -7,12 +7,12 @@ import {Currency} from "v4-core/types/Currency.sol";
 import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
-import {IERC6909} from "@openzeppelin/contracts/interfaces/IERC6909.sol";
+import {IERC6909Claims} from "v4-core/src/interfaces/external/IERC6909Claims.sol";
 import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
 
 
-contract LimitOrderHook is BaseHook, IERC6909 {
+contract LimitOrderHook is BaseHook, IERC6909Claims {
     using EnumerableSet for EnumerableSet.Int24Set;
     using CurrencySettler for Currency;
 
@@ -28,9 +28,18 @@ contract LimitOrderHook is BaseHook, IERC6909 {
         int24 bottomTick;      // Bottom tick for range orders
         int24 topTick;         // Top tick for range orders
         bool executed;         // Whether the order has been executed 
+        int256 token0Delta;   // Track exact amount of token0 to claim
+        int256 token1Delta;   // Track exact amount of token1 to claim
         uint256 executionFees0; // Fees earned in token0
         uint256 executionFees1;  // Fees earned in token1
     }
+    // Add slot constant 
+    bytes32 constant PREVIOUS_TICK_SLOT = keccak256("uniswap.hooks.limitorder.previous-tick");
+    
+    // Add the new allowance mapping required by IERC6909Claims
+    mapping(address => mapping(address => mapping(uint256 => uint256))) private _allowances;
+
+
 
     // Mapping from poolId to tick to orderIds
     mapping(bytes32 => mapping(int24 => bytes32[])) public tickToOrders;
@@ -77,7 +86,7 @@ contract LimitOrderHook is BaseHook, IERC6909 {
     ) external override returns (bytes4) {
         (,int24 oldTick,,,,,) = poolManager.getSlot0(key.toId());
         assembly {
-            tstore(0x4444000000000000000000000000000000000000000000000000000000000000, oldTick)
+            tstore(PREVIOUS_TICK_SLOT, oldTick)
         }
         return BaseHook.beforeSwap.selector;
     }
@@ -93,7 +102,7 @@ contract LimitOrderHook is BaseHook, IERC6909 {
         // Get old and new tick
         int24 oldTick;
         assembly {
-            oldTick := tload(0x4444000000000000000000000000000000000000000000000000000000000000)
+            oldTick := tload(PREVIOUS_TICK_SLOT)
         }
         (,int24 newTick,,,,,)=poolManager.getSlot0(poolId);
 
@@ -136,7 +145,8 @@ contract LimitOrderHook is BaseHook, IERC6909 {
         LimitOrder storage order,
         bytes32 orderId
     ) internal {
-        // Burn liquidity from pool
+        // Burn liquidity from pool and get exact token amounts
+        (BalanceDelta delta, BalanceDelta feeDelta) = 
         poolManager.modifyLiquidity(
             key,
             IPoolManager.ModifyLIquidityParams({
@@ -150,30 +160,57 @@ contract LimitOrderHook is BaseHook, IERC6909 {
     }
 
     // ERC-6909 functions
+
+    // Add required function from IERC6909Claims
+    function allowance(address owner, address spender, uint256 id) external view returns (uint256) {
+        return _allowances[owner][spender][id];
+    }
+
+    // Add required function from IERC6909Claims
+    function approve(address spender, uint256 id, uint256 amount) external returns (bool) {
+        _allowances[msg.sender][spender][id] = amount;
+        emit Approval(msg.sender, spender, id, amount);
+        return true;
+    }
+
+    // Modify your setOperator to emit the correct event
     function setOperator(address operator, bool approved) external returns (bool) {
         isOperator[msg.sender][operator] = approved;
+        emit OperatorSet(msg.sender, operator, approved);
         return true;
     }
 
-    function transfer(address to, uint256 id, uint256 amount) external returns (bool) {
+    // Modify your existing transfer function to emit the correct event
+    function transfer(address receiver, uint256 id, uint256 amount) external returns (bool) {
         balanceOf[msg.sender][id] -= amount;
-        balanceOf[to][id] += amount;
+        balanceOf[receiver][id] += amount;
+        emit Transfer(msg.sender, msg.sender, receiver, id, amount);
         return true;
     }
 
+    // Modify your transferFrom to match IERC6909Claims
     function transferFrom(
-        address from,
-        address to, 
+        address sender,
+        address receiver,
+        uint256 id,
         uint256 amount
     ) external returns (bool) {
-        require(
-            from == msg.sender || isOperator[from][msg.sender],
-            "Not authorized"
-        );
-        balanceOf[from][id] -= amount;
-        balanceOf[to][id] += amount;
+        if (sender != msg.sender && !isOperator[sender][msg.sender]) {
+            uint256 allowed = _allowances[sender][msg.sender][id];
+            if (amount > allowed) revert("Transfer amount exceeds allowance");
+            _allowances[sender][msg.sender][id] = allowed - amount;
+        }
+        
+        balanceOf[sender][id] -= amount;
+        balanceOf[receiver][id] += amount;
+        emit Transfer(msg.sender, sender, receiver, id, amount);
         return true;
     }
+    
+    // Add required events from IERC6909Claims
+    event Transfer(address caller, address indexed from, address indexed to, uint256 indexed id, uint256 amount);
+    event Approval(address indexed owner, address indexed spender, uint256 indexed id, uint256 amount);
+    event OperatorSet(address indexed owner, address indexed operator, bool approved);
 
     // Function to claim executed limit orders
     function claimLimitOrder(bytes32 orderId) external {
@@ -190,7 +227,7 @@ contract LimitOrderHook is BaseHook, IERC6909 {
         // Implement actual token transfer logic
     } 
 
-    event LimitOredrExecuted(
+    event LimitOrderExecuted(
         bytes32 indexed orderId,
         address indexed owner,
         uint256 amount0,
