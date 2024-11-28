@@ -437,60 +437,123 @@ function createLimitOrder(
         return (BaseHook.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
     }
 
-        function afterSwap(
-            address sender,
-            PoolKey calldata key,
-            IPoolManager.SwapParams calldata params,
-            BalanceDelta delta,
-            bytes calldata data
-        ) external override returns (bytes4, int128) {
-            bytes32 poolId = getPoolId(key);
-            // Load using type-safe transient storage
-            TransientSlot.Int256Slot slot = TransientSlot.asInt256(PREVIOUS_TICK_SLOT);
-            int24 oldTick = int24(TransientSlot.tload(slot));
+    // function afterSwap(
+    //     address sender,
+    //     PoolKey calldata key,
+    //     IPoolManager.SwapParams calldata params,
+    //     BalanceDelta delta,
+    //     bytes calldata data
+    // ) external override returns (bytes4, int128) {
+    //     bytes32 poolId = getPoolId(key);
+    //     // Load using type-safe transient storage
+    //     TransientSlot.Int256Slot slot = TransientSlot.asInt256(PREVIOUS_TICK_SLOT);
+    //     int24 oldTick = int24(TransientSlot.tload(slot));
+        
+    //     (,int24 newTick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
+        
+    //     // Check orders based on swap direction
+    //     uint256 length = poolTicks[poolId].length();
+    //     for (uint256 i = 0; i < length;) {
+    //         int24 tick = int24(int256(poolTicks[poolId].at(i)));
             
-            (,int24 newTick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
-            
-            // Check orders based on swap direction
-            uint256 length = poolTicks[poolId].length();
-            for (uint256 i = 0; i < length;) {
-                int24 tick = int24(int256(poolTicks[poolId].at(i)));
+    //         // For 0->1 swaps, execute when reaching topTick
+    //         if (params.zeroForOne && tick <= oldTick && tick > newTick) {
+    //             bytes32[] storage orderIds = tickToOrders[poolId][tick];
                 
-                // For 0->1 swaps, execute when reaching topTick
-                if (params.zeroForOne && tick <= oldTick && tick > newTick) {
-                    bytes32[] storage orderIds = tickToOrders[poolId][tick];
-                    
-                    for(uint256 j = 0; j < orderIds.length; j++) {
-                        LimitOrder storage order = limitOrders[orderIds[j]];
-                        if (!order.executed && !order.isToken0) {
-                            _burnLimitOrder(key, order, orderIds[j]);
-                            (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
-                            poolManager.mint(address(this), key.currency0.toId(), amount0);
-                            poolManager.mint(address(this), key.currency1.toId(), amount1);
-                            emit LimitOrderExecuted(orderIds[j], order.owner, amount0, amount1);
-                        }
-                    }
-                }
-                // For 1->0 swaps, execute when below bottomTick
-                else if (!params.zeroForOne && tick >= oldTick && tick < newTick) {
-                    bytes32[] storage orderIds = tickToOrders[poolId][tick];
-                    
-                    for(uint256 j = 0; j < orderIds.length; j++) {
-                        LimitOrder storage order = limitOrders[orderIds[j]];
-                        if (!order.executed && order.isToken0) {
-                            _burnLimitOrder(key, order, orderIds[j]);
-                            (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
-                            poolManager.mint(address(this), key.currency0.toId(), amount0);
-                            poolManager.mint(address(this), key.currency1.toId(), amount1);
-                            emit LimitOrderExecuted(orderIds[j], order.owner, amount0, amount1);
-                        }
-                    }
-                }
-                unchecked { ++i; }
-            }
-            return (BaseHook.afterSwap.selector, 0);
-        }
+    //             for(uint256 j = 0; j < orderIds.length; j++) {
+    //                 LimitOrder storage order = limitOrders[orderIds[j]];
+    //                 if (!order.executed && !order.isToken0) {
+    //                     _burnLimitOrder(key, order, orderIds[j]);
+    //                     (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
+    //                     poolManager.mint(address(this), key.currency0.toId(), amount0);
+    //                     poolManager.mint(address(this), key.currency1.toId(), amount1);
+    //                     emit LimitOrderExecuted(orderIds[j], order.owner, amount0, amount1);
+    //                 }
+    //             }
+    //         }
+    //         // For 1->0 swaps, execute when below bottomTick
+    //         else if (!params.zeroForOne && tick >= oldTick && tick < newTick) {
+    //             bytes32[] storage orderIds = tickToOrders[poolId][tick];
+                
+    //             for(uint256 j = 0; j < orderIds.length; j++) {
+    //                 LimitOrder storage order = limitOrders[orderIds[j]];
+    //                 if (!order.executed && order.isToken0) {
+    //                     _burnLimitOrder(key, order, orderIds[j]);
+    //                     (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
+    //                     poolManager.mint(address(this), key.currency0.toId(), amount0);
+    //                     poolManager.mint(address(this), key.currency1.toId(), amount1);
+    //                     emit LimitOrderExecuted(orderIds[j], order.owner, amount0, amount1);
+    //                 }
+    //             }
+    //         }
+    //         unchecked { ++i; }
+    //     }
+    //     return (BaseHook.afterSwap.selector, 0);
+    // }
+    function afterSwap(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata data
+    ) external override returns (bytes4, int128) {
+        bytes32 poolId = getPoolId(key);
+        int24 oldTick = int24(TransientSlot.tload(TransientSlot.asInt256(PREVIOUS_TICK_SLOT)));
+        (,int24 newTick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
+        
+        _processAllTicks(poolId, key, oldTick, newTick, params.zeroForOne);
+        return (BaseHook.afterSwap.selector, 0);
+    }
 
+    function _processAllTicks(
+        bytes32 poolId,
+        PoolKey calldata key,
+        int24 oldTick,
+        int24 newTick,
+        bool zeroForOne
+    ) internal {
+        uint256 length = poolTicks[poolId].length();
+        for (uint256 i = 0; i < length;) {
+            int24 tick = int24(int256(poolTicks[poolId].at(i)));
+            bool shouldExecute = zeroForOne ? 
+                (tick <= oldTick && tick > newTick) : 
+                (tick >= oldTick && tick < newTick);
+                
+            if (shouldExecute) {
+                bytes32[] storage orderIds = tickToOrders[poolId][tick];
+                for(uint256 j = 0; j < orderIds.length; j++) {
+                    LimitOrder storage order = limitOrders[orderIds[j]];
+                    if (!order.executed && order.isToken0 == !zeroForOne) {
+                        _processOrder(key, order, orderIds[j]);
+                    }
+                }
+            }
+            unchecked { ++i; }
+        }
+    }
+
+    function _processOrder(
+        PoolKey calldata key,
+        LimitOrder storage order,
+        bytes32 orderId
+    ) internal {
+        _burnLimitOrder(key, order, orderId);
+        (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
+        _mintAndEmit(key, order.owner, orderId, amount0, amount1);
+    }
+
+    function _mintAndEmit(
+        PoolKey calldata key,
+        address owner,
+        bytes32 orderId,
+        uint256 amount0,
+        uint256 amount1
+    ) internal {
+        poolManager.mint(address(this), key.currency0.toId(), amount0);
+        poolManager.mint(address(this), key.currency1.toId(), amount1);
+        emit LimitOrderExecuted(orderId, owner, amount0, amount1);
+    }
+    
     function getPoolId(PoolKey memory key) internal pure returns (bytes32) {
         return keccak256(abi.encode(
             key.currency0,
