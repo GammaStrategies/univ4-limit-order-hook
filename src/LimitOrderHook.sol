@@ -25,6 +25,9 @@ contract LimitOrderHook is BaseHook {
 
 
     // Struct to represent a limit order
+    // Need to handle locking when creating limit order, burning limit order, and claiming 
+
+    
     struct LimitOrder {
         address owner;      // Who is eligible to claim the proceeds from the limit order upon execution
         bool isToken0;         // Whether the input token is token0
