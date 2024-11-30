@@ -7,7 +7,8 @@ import {Currency} from "v4-core/types/Currency.sol";
 import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
-import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+// import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {TickBitmap} from "v4-core/libraries/TickBitmap.sol";
 import {TransientSlot} from "../lib/openzeppelin-contracts/contracts/utils/TransientSlot.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
@@ -19,15 +20,16 @@ import {BeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {PoolId} from "v4-core/types/PoolId.sol";
 
 contract LimitOrderHook is BaseHook {
-    using EnumerableSet for EnumerableSet.UintSet;
+    // using EnumerableSet for EnumerableSet.UintSet;
     using CurrencySettler for Currency;
     using TransientSlot for *; 
+    using TickBitmap for mapping(int16 => uint256);
 
 
     // Struct to represent a limit order
     // Need to handle locking when creating limit order, burning limit order, and claiming 
 
-    
+
     struct LimitOrder {
         address owner;      // Who is eligible to claim the proceeds from the limit order upon execution
         bool isToken0;         // Whether the input token is token0
@@ -42,6 +44,15 @@ contract LimitOrderHook is BaseHook {
         uint256 executionFees1;  // Fees earned in token1
         uint128 liquidity;  // Add this field
     }
+   
+    struct OrderParams {
+        bool isToken0;
+        bool isRange;
+        int24 bottomTick;
+        int24 topTick;
+        uint128 liquidity;
+        int24 tickSpacing;  // Add this
+    }
 
     // Add slot constant 
     bytes32 private constant PREVIOUS_TICK_SLOT = keccak256("xyz.hooks.limitorder.previous-tick");
@@ -52,8 +63,9 @@ contract LimitOrderHook is BaseHook {
     // All limit orders
     mapping(bytes32 => LimitOrder) public limitOrders;
     // Track which ticks have limit orders
-    mapping(bytes32 => EnumerableSet.UintSet) private poolTicks;
-
+    // mapping(bytes32 => EnumerableSet.UintSet) private poolTicks;
+    mapping(bytes32 => mapping(int16 => uint256)) public tickBitmap;
+    
     event LimitOrderExecuted(bytes32 indexed orderId, address indexed owner, uint256 amount0, uint256 amount1);
 
     constructor(IPoolManager poolManager) BaseHook(poolManager) {}
@@ -145,15 +157,15 @@ contract LimitOrderHook is BaseHook {
             revert TickOutOfBounds(targetTick);
         }
     }
-function createLimitOrder(
-        bool isToken0,
-        bool isRange,
-        uint256 price,
-        uint256 amount,
-        PoolKey calldata key
-    ) external returns (bytes32 orderId) {
-        orderId = _createOrder(isToken0, isRange, price, amount, key);
-    }
+    function createLimitOrder(
+            bool isToken0,
+            bool isRange,
+            uint256 price,
+            uint256 amount,
+            PoolKey calldata key
+        ) external returns (bytes32 orderId) {
+            orderId = _createOrder(isToken0, isRange, price, amount, key);
+        }
 
     function _createOrder(
         bool isToken0,
@@ -197,20 +209,23 @@ function createLimitOrder(
             liquidity
         );
 
-        // Create and store the order
+        OrderParams memory params = OrderParams({
+            isToken0: isToken0,
+            isRange: isRange,
+            bottomTick: bottomTick,
+            topTick: topTick,
+            liquidity: liquidity,
+            tickSpacing: key.tickSpacing
+        });
+
         orderId = _storeOrder(
-            poolId,
-            isToken0,
-            isRange,
-            bottomTick,
-            topTick,
-            liquidity,
-            delta
+            params,
+            delta,
+            key
         );
 
         return orderId;
     }
-
     function _calculateTicks(
         bool isToken0,
         bool isRange,
@@ -284,146 +299,33 @@ function createLimitOrder(
     }
 
     function _storeOrder(
-        bytes32 poolId,
-        bool isToken0,
-        bool isRange,
-        int24 bottomTick,
-        int24 topTick,
-        uint128 liquidity,  // Add liquidity parameter
-        BalanceDelta delta
+        OrderParams memory params,
+        BalanceDelta delta,
+        PoolKey calldata key
     ) internal returns (bytes32) {
+        bytes32 poolId = getPoolId(key);  // Get poolId from key
         bytes32 orderId = keccak256(abi.encode(poolId, msg.sender, block.timestamp));
         
         limitOrders[orderId] = LimitOrder({
             owner: msg.sender,
-            isToken0: isToken0,
-            isRange: isRange,
-            targetTick: isToken0 ? bottomTick : topTick,
-            bottomTick: bottomTick,
-            topTick: topTick,
+            isToken0: params.isToken0,
+            isRange: params.isRange,
+            targetTick: params.isToken0 ? params.bottomTick : params.topTick,
+            bottomTick: params.bottomTick,
+            topTick: params.topTick,
             executed: false,
             token0Delta: delta.amount0(),
             token1Delta: delta.amount1(),
             executionFees0: 0,
             executionFees1: 0,
-            liquidity: liquidity
+            liquidity: params.liquidity
         });
 
-        _addTickToPool(poolId, isToken0 ? bottomTick : topTick);
-        tickToOrders[poolId][isToken0 ? bottomTick : topTick].push(orderId);
+        _addTickToPool(poolId, params.isToken0 ? params.bottomTick : params.topTick, key.tickSpacing);
+        tickToOrders[poolId][params.isToken0 ? params.bottomTick : params.topTick].push(orderId);
 
         return orderId;
     }
-    // function createLimitOrder(
-    //     bool isToken0,
-    //     bool isRange,
-    //     uint256 price,
-    //     uint256 amount,
-    //     PoolKey calldata key
-    // ) external returns (bytes32 orderId) {
-    //     // Basic input validation
-    //     if (price == 0) revert PriceMustBeGreaterThanZero();
-    //     if (amount == 0) revert AmountTooLow();
-
-    //     // Get current pool state
-    //     bytes32 poolId = getPoolId(key);
-    //     (uint160 currentSqrtPriceX96, int24 currentTick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
-
-    //     // Convert price to tick
-    //     uint160 targetSqrtPriceX96 = getSqrtPriceFromPrice(price);
-        
-    //     // Get tick from sqrt price
-    //     int24 rawTargetTick = TickMath.getTickAtSqrtPrice(targetSqrtPriceX96);
-
-    //     // Get valid tick range based on order type
-    //     (int24 bottomTick, int24 topTick) = _getValidTickRange(
-    //         currentTick,
-    //         rawTargetTick,
-    //         key.tickSpacing,
-    //         isToken0,
-    //         isRange
-    //     );
-
-    //     // Transfer tokens to PoolManager
-    //     if (isToken0) {
-    //         CurrencySettler.settle(
-    //             key.currency0, 
-    //             poolManager,
-    //             msg.sender, 
-    //             amount,
-    //             false  // use transfer instead of burn
-    //         );
-    //     } else {
-    //         CurrencySettler.settle(
-    //             key.currency1,
-    //             poolManager,
-    //             msg.sender,
-    //             amount,
-    //             false  // use transfer instead of burn
-    //         );
-    //     }
-
-    //     // Calculate liquidity amount
-    //     uint128 liquidity;
-    //     if (isToken0) {
-    //         liquidity = LiquidityAmounts.getLiquidityForAmount0(
-    //             TickMath.getSqrtPriceAtTick(bottomTick),
-    //             TickMath.getSqrtPriceAtTick(topTick),
-    //             amount
-    //         );
-    //     } else {
-    //         liquidity = LiquidityAmounts.getLiquidityForAmount1(
-    //             TickMath.getSqrtPriceAtTick(bottomTick),
-    //             TickMath.getSqrtPriceAtTick(topTick),
-    //             amount
-    //         );
-    //     }
-
-    //     // Add liquidity to pool
-    //     bytes32 salt = keccak256(abi.encodePacked(
-    //         msg.sender,
-    //         isToken0,
-    //         bottomTick,
-    //         topTick,
-    //         block.timestamp
-    //     ));
-
-    //     (BalanceDelta delta,) = poolManager.modifyLiquidity(
-    //         key,
-    //         IPoolManager.ModifyLiquidityParams({
-    //             tickLower: bottomTick,
-    //             tickUpper: topTick,
-    //             liquidityDelta: int256(uint256(liquidity)),
-    //             salt: salt
-    //         }),
-    //         ""
-    //     );
-
-    //     // Create and store the order
-    //     orderId = keccak256(abi.encode(bytes32(poolId), msg.sender, block.timestamp));
-    //     limitOrders[orderId] = LimitOrder({
-    //         owner: msg.sender,
-    //         isToken0: isToken0,
-    //         isRange: isRange,
-    //         targetTick: isToken0 ? bottomTick : topTick,
-    //         bottomTick: bottomTick,
-    //         topTick: topTick,
-    //         executed: false,
-    //         token0Delta: delta.amount0(),
-    //         token1Delta: delta.amount1(),
-    //         executionFees0: 0,
-    //         executionFees1: 0,
-    //         liquidity: liquidity  // Add this field
-    //     });
-
-    //     // Update tick tracking
-    //     _addTickToPool(poolId, isToken0 ? bottomTick : topTick);
-    //     tickToOrders[poolId][isToken0 ? bottomTick : topTick].push(orderId);
-
-    //     return orderId;
-    // }
-
-    // Store old tick in transient storage
     function beforeSwap(
         address sender,
         PoolKey calldata key, 
@@ -440,59 +342,6 @@ function createLimitOrder(
         return (BaseHook.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
     }
 
-    // function afterSwap(
-    //     address sender,
-    //     PoolKey calldata key,
-    //     IPoolManager.SwapParams calldata params,
-    //     BalanceDelta delta,
-    //     bytes calldata data
-    // ) external override returns (bytes4, int128) {
-    //     bytes32 poolId = getPoolId(key);
-    //     // Load using type-safe transient storage
-    //     TransientSlot.Int256Slot slot = TransientSlot.asInt256(PREVIOUS_TICK_SLOT);
-    //     int24 oldTick = int24(TransientSlot.tload(slot));
-        
-    //     (,int24 newTick,,) = StateLibrary.getSlot0(poolManager, PoolId.wrap(poolId));
-        
-    //     // Check orders based on swap direction
-    //     uint256 length = poolTicks[poolId].length();
-    //     for (uint256 i = 0; i < length;) {
-    //         int24 tick = int24(int256(poolTicks[poolId].at(i)));
-            
-    //         // For 0->1 swaps, execute when reaching topTick
-    //         if (params.zeroForOne && tick <= oldTick && tick > newTick) {
-    //             bytes32[] storage orderIds = tickToOrders[poolId][tick];
-                
-    //             for(uint256 j = 0; j < orderIds.length; j++) {
-    //                 LimitOrder storage order = limitOrders[orderIds[j]];
-    //                 if (!order.executed && !order.isToken0) {
-    //                     _burnLimitOrder(key, order, orderIds[j]);
-    //                     (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
-    //                     poolManager.mint(address(this), key.currency0.toId(), amount0);
-    //                     poolManager.mint(address(this), key.currency1.toId(), amount1);
-    //                     emit LimitOrderExecuted(orderIds[j], order.owner, amount0, amount1);
-    //                 }
-    //             }
-    //         }
-    //         // For 1->0 swaps, execute when below bottomTick
-    //         else if (!params.zeroForOne && tick >= oldTick && tick < newTick) {
-    //             bytes32[] storage orderIds = tickToOrders[poolId][tick];
-                
-    //             for(uint256 j = 0; j < orderIds.length; j++) {
-    //                 LimitOrder storage order = limitOrders[orderIds[j]];
-    //                 if (!order.executed && order.isToken0) {
-    //                     _burnLimitOrder(key, order, orderIds[j]);
-    //                     (uint256 amount0, uint256 amount1) = _calculateExecutionAmounts(order);
-    //                     poolManager.mint(address(this), key.currency0.toId(), amount0);
-    //                     poolManager.mint(address(this), key.currency1.toId(), amount1);
-    //                     emit LimitOrderExecuted(orderIds[j], order.owner, amount0, amount1);
-    //                 }
-    //             }
-    //         }
-    //         unchecked { ++i; }
-    //     }
-    //     return (BaseHook.afterSwap.selector, 0);
-    // }
     function afterSwap(
         address sender,
         PoolKey calldata key,
@@ -515,15 +364,19 @@ function createLimitOrder(
         int24 newTick,
         bool zeroForOne
     ) internal {
-        uint256 length = poolTicks[poolId].length();
-        for (uint256 i = 0; i < length;) {
-            int24 tick = int24(int256(poolTicks[poolId].at(i)));
-            bool shouldExecute = zeroForOne ? 
-                (tick <= oldTick && tick > newTick) : 
-                (tick >= oldTick && tick < newTick);
-                
-            if (shouldExecute) {
-                bytes32[] storage orderIds = tickToOrders[poolId][tick];
+        int24 processedTick = oldTick;
+        bool initialized = false;
+
+        while (zeroForOne ? processedTick > newTick : processedTick < newTick) {
+            (int24 nextTick, bool hasOrders) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
+                processedTick,
+                key.tickSpacing,
+                zeroForOne // true = look left, false = look right
+            );
+
+            // If we found a tick with orders
+            if (hasOrders) {
+                bytes32[] storage orderIds = tickToOrders[poolId][nextTick];
                 for(uint256 j = 0; j < orderIds.length; j++) {
                     LimitOrder storage order = limitOrders[orderIds[j]];
                     if (!order.executed && order.isToken0 == !zeroForOne) {
@@ -531,7 +384,8 @@ function createLimitOrder(
                     }
                 }
             }
-            unchecked { ++i; }
+
+            processedTick = nextTick;
         }
     }
 
@@ -625,20 +479,40 @@ function createLimitOrder(
                 tickLower: order.bottomTick,
                 tickUpper: order.topTick,
                 liquidityDelta: -int128(order.liquidity),
-                salt: bytes32(0)  // Add empty salt
+                salt: bytes32(0)
             }),
-            "" // Add empty hookData
+            ""
         );
+
+        // Get the relevant tick for this order
+        bytes32 poolId = getPoolId(key);
+        int24 tickToClean = order.isToken0 ? order.bottomTick : order.topTick;
+        
+        // Remove the order from tickToOrders
+        bytes32[] storage ordersAtTick = tickToOrders[poolId][tickToClean];
+        for (uint256 i = 0; i < ordersAtTick.length; i++) {
+            if (ordersAtTick[i] == orderId) {
+                // Replace with last element and pop
+                ordersAtTick[i] = ordersAtTick[ordersAtTick.length - 1];
+                ordersAtTick.pop();
+                break;
+            }
+        }
+        
+        // If no more orders at this tick, unflip the bit
+        if (ordersAtTick.length == 0) {
+            _removeTickFromPool(poolId, tickToClean, key.tickSpacing);
+        }
 
         order.executed = true;
     }
 
-    function _addTickToPool(bytes32 poolId, int24 tick) internal returns (bool) {
-        return poolTicks[poolId].add(uint256(int256(tick)));
+    function _addTickToPool(bytes32 poolId, int24 tick, int24 tickSpacing) internal {
+        tickBitmap[poolId].flipTick(tick, tickSpacing);
     }
 
-    function _removeTickFromPool(bytes32 poolId, int24 tick) internal returns (bool) {
-        return poolTicks[poolId].remove(uint256(int256(tick)));
+    function _removeTickFromPool(bytes32 poolId, int24 tick, int24 tickSpacing) internal {
+        tickBitmap[poolId].flipTick(tick, tickSpacing);
     }
 
 
