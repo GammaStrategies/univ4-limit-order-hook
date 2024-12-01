@@ -7,7 +7,6 @@ import {Currency} from "v4-core/types/Currency.sol";
 import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
-// import {EnumerableSet} from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {TickBitmap} from "v4-core/libraries/TickBitmap.sol";
 import {TransientSlot} from "../lib/openzeppelin-contracts/contracts/utils/TransientSlot.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
@@ -18,9 +17,9 @@ import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 import {BeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {PoolId} from "v4-core/types/PoolId.sol";
+import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 
 contract LimitOrderHook is BaseHook {
-    // using EnumerableSet for EnumerableSet.UintSet;
     using CurrencySettler for Currency;
     using TransientSlot for *; 
     using TickBitmap for mapping(int16 => uint256);
@@ -42,7 +41,7 @@ contract LimitOrderHook is BaseHook {
         int256 token1Delta;   // Track exact amount of token1 to claim
         uint256 executionFees0; // Fees earned in token0
         uint256 executionFees1;  // Fees earned in token1
-        uint128 liquidity;  // Add this field
+        uint128 liquidity;  
     }
    
     struct OrderParams {
@@ -51,8 +50,25 @@ contract LimitOrderHook is BaseHook {
         int24 bottomTick;
         int24 topTick;
         uint128 liquidity;
-        int24 tickSpacing;  // Add this
+        int24 tickSpacing;  
     }
+
+    struct ModifyLiquidityCallbackData {
+        PoolKey key;
+        int24 bottomTick;
+        int24 topTick;
+        int256 liquidityDelta;
+        bytes32 salt;
+    }
+
+    struct BatchExecuteData {
+        PoolKey key;
+        LimitOrder[] ordersToProcess;
+        bytes32[] orderIds;
+        int256 totalToken0Delta;
+        int256 totalToken1Delta;
+    }
+
 
     // Add slot constant 
     bytes32 private constant PREVIOUS_TICK_SLOT = keccak256("xyz.hooks.limitorder.previous-tick");
@@ -63,7 +79,7 @@ contract LimitOrderHook is BaseHook {
     // All limit orders
     mapping(bytes32 => LimitOrder) public limitOrders;
     // Track which ticks have limit orders
-    // mapping(bytes32 => EnumerableSet.UintSet) private poolTicks;
+
     mapping(bytes32 => mapping(int16 => uint256)) public tickBitmap;
     
     event LimitOrderExecuted(bytes32 indexed orderId, address indexed owner, uint256 amount0, uint256 amount1);
@@ -91,72 +107,13 @@ contract LimitOrderHook is BaseHook {
 
     // Custom errors
     error InvalidPrice(uint256 price);
-    error PriceOutOfRange();
     error TickNotDivisibleBySpacing(int24 tick, int24 spacing);
     error InvalidExecutionDirection(bool isToken0, int24 targetTick, int24 currentTick);
     error TickOutOfBounds(int24 tick);
     error PriceMustBeGreaterThanZero();
     error AmountTooLow();
-    error SlippageTooHigh();
 
-    function _getValidTickRange(
-        int24 currentTick,
-        int24 targetTick,
-        int24 tickSpacing,
-        bool isToken0,
-        bool isRange
-    ) internal pure returns (int24 bottomTick, int24 topTick) {
-        // Round target tick based on isToken0
-        if (isToken0) {
-            // For token0 orders, round down to nearest valid tick spacing
-            // Example: targetTick = 155, tickSpacing = 60 => targetTick = 120
-            targetTick = (targetTick / tickSpacing) * tickSpacing;
-        } else {
-            // For token1 orders, round up to next valid tick spacing
-            // Example: targetTick = 155, tickSpacing = 60 => targetTick = 180
-            targetTick = ((targetTick / tickSpacing) + 1) * tickSpacing;
-        }
-        
-        if (isToken0) {
-            // Selling token0, executes on price decrease
-            if (isRange) {
-                bottomTick = targetTick;
-                // Find largest valid tick spacing <= currentTick
-                // Example: currentTick = 50, tickSpacing = 60 => topTick = 0
-                topTick = (currentTick / tickSpacing) * tickSpacing;
-            } else {
-                // Single tick order spans exactly one tick spacing
-                bottomTick = targetTick;
-                topTick = targetTick + tickSpacing;
-            }
-            // Validate that target is below current price for token0 orders
-            if (bottomTick >= currentTick) {
-                revert InvalidExecutionDirection(true, targetTick, currentTick);
-            }
-        } else {
-            // Selling token1, executes on price increase
-            if (isRange) {
-                // Find smallest valid tick spacing > currentTick
-                // Example: currentTick = 50, tickSpacing = 60 => bottomTick = 60
-                bottomTick = ((currentTick / tickSpacing) + 1) * tickSpacing;
-                topTick = targetTick;
-            } else {
-                // Single tick order spans exactly one tick spacing
-                bottomTick = targetTick - tickSpacing;
-                topTick = targetTick;
-            }
-            // Validate that target is above current price for token1 orders
-            if (topTick <= currentTick) {
-                revert InvalidExecutionDirection(false, targetTick, currentTick);
-            }
-        }
-        
-        // Ensure ticks are within valid range for the pool
-        if (bottomTick < TickMath.minUsableTick(tickSpacing) || 
-            topTick > TickMath.maxUsableTick(tickSpacing)) {
-            revert TickOutOfBounds(targetTick);
-        }
-    }
+
     function createLimitOrder(
             bool isToken0,
             bool isRange,
@@ -244,15 +201,74 @@ contract LimitOrderHook is BaseHook {
         );
     }
 
+    function _getValidTickRange(
+        int24 currentTick,
+        int24 targetTick,
+        int24 tickSpacing,
+        bool isToken0,
+        bool isRange
+    ) internal pure returns (int24 bottomTick, int24 topTick) {
+        // Round target tick based on isToken0
+        if (isToken0) {
+            // For token0 orders, round down to nearest valid tick spacing
+            // Example: targetTick = 155, tickSpacing = 60 => targetTick = 120
+            targetTick = (targetTick / tickSpacing) * tickSpacing;
+        } else {
+            // For token1 orders, round up to next valid tick spacing
+            // Example: targetTick = 155, tickSpacing = 60 => targetTick = 180
+            targetTick = ((targetTick / tickSpacing) + 1) * tickSpacing;
+        }
+        
+        if (isToken0) {
+            // Selling token0, executes on price decrease
+            if (isRange) {
+                bottomTick = targetTick;
+                // Find largest valid tick spacing <= currentTick
+                // Example: currentTick = 50, tickSpacing = 60 => topTick = 0
+                topTick = (currentTick / tickSpacing) * tickSpacing;
+            } else {
+                // Single tick order spans exactly one tick spacing
+                bottomTick = targetTick;
+                topTick = targetTick + tickSpacing;
+            }
+            // Validate that target is below current price for token0 orders
+            if (bottomTick >= currentTick) {
+                revert InvalidExecutionDirection(true, targetTick, currentTick);
+            }
+        } else {
+            // Selling token1, executes on price increase
+            if (isRange) {
+                // Find smallest valid tick spacing > currentTick
+                // Example: currentTick = 50, tickSpacing = 60 => bottomTick = 60
+                bottomTick = ((currentTick / tickSpacing) + 1) * tickSpacing;
+                topTick = targetTick;
+            } else {
+                // Single tick order spans exactly one tick spacing
+                bottomTick = targetTick - tickSpacing;
+                topTick = targetTick;
+            }
+            // Validate that target is above current price for token1 orders
+            if (topTick <= currentTick) {
+                revert InvalidExecutionDirection(false, targetTick, currentTick);
+            }
+        }
+        
+        // Ensure ticks are within valid range for the pool
+        if (bottomTick < TickMath.minUsableTick(tickSpacing) || 
+            topTick > TickMath.maxUsableTick(tickSpacing)) {
+            revert TickOutOfBounds(targetTick);
+        }
+    }
+
     function _handleTokenTransfer(
         bool isToken0,
         uint256 amount,
         PoolKey calldata key
     ) internal {
         if (isToken0) {
-            CurrencySettler.settle(key.currency0, poolManager, msg.sender, amount, false);
+            IERC20Minimal(Currency.unwrap(key.currency0)).transferFrom(msg.sender, address(this), amount);
         } else {
-            CurrencySettler.settle(key.currency1, poolManager, msg.sender, amount, false);
+            IERC20Minimal(Currency.unwrap(key.currency1)).transferFrom(msg.sender, address(this), amount);
         }
     }
 
@@ -286,18 +302,103 @@ contract LimitOrderHook is BaseHook {
             block.timestamp
         ));
 
-        return poolManager.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: bottomTick,
-                tickUpper: topTick,
-                liquidityDelta: int256(uint256(liquidity)),
-                salt: salt
-            }),
-            ""
-        );
+        ModifyLiquidityCallbackData memory callbackData = ModifyLiquidityCallbackData({
+            key: key,
+            bottomTick: bottomTick,
+            topTick: topTick,
+            liquidityDelta: int256(uint256(liquidity)),
+            salt: salt
+        });
+
+        bytes memory result = poolManager.unlock(abi.encode(callbackData));
+        (delta, feeDelta) = abi.decode(result, (BalanceDelta, BalanceDelta));
     }
 
+    function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
+        if (data.length > 0) {
+            // Handle regular liquidity modification callback
+            if (bytes4(data) == bytes4(keccak256("ModifyLiquidityCallbackData"))) {
+                ModifyLiquidityCallbackData memory callbackData = abi.decode(data, (ModifyLiquidityCallbackData));
+                
+                (BalanceDelta delta, BalanceDelta feeDelta) = poolManager.modifyLiquidity(
+                    callbackData.key,
+                    IPoolManager.ModifyLiquidityParams({
+                        tickLower: callbackData.bottomTick,
+                        tickUpper: callbackData.topTick,
+                        liquidityDelta: callbackData.liquidityDelta,
+                        salt: callbackData.salt
+                    }),
+                    ""
+                );
+
+                return abi.encode(delta, feeDelta);
+            }
+            // Handle batch execution callback
+            else if (bytes4(data) == bytes4(keccak256("BatchExecuteData"))) {
+                BatchExecuteData memory batchData = abi.decode(data, (BatchExecuteData));
+                
+                // First burn all liquidity positions
+                for (uint256 i = 0; i < batchData.ordersToProcess.length; i++) {
+                    if (address(batchData.ordersToProcess[i].owner) == address(0)) break; // End of valid orders
+                    
+                    (BalanceDelta delta,) = poolManager.modifyLiquidity(
+                        batchData.key,
+                        IPoolManager.ModifyLiquidityParams({
+                            tickLower: batchData.ordersToProcess[i].bottomTick,
+                            tickUpper: batchData.ordersToProcess[i].topTick,
+                            liquidityDelta: -int128(batchData.ordersToProcess[i].liquidity),
+                            salt: bytes32(0)
+                        }),
+                        ""
+                    );
+
+                    // Accumulate deltas
+                    batchData.totalToken0Delta += delta.amount0();
+                    batchData.totalToken1Delta += delta.amount1();
+                    
+                    // Update order state
+                    bytes32 orderId = batchData.orderIds[i];
+                    LimitOrder storage order = limitOrders[orderId];
+                    order.executed = true;
+                    
+                    // Clean up tick bitmap and order tracking
+                    bytes32 poolId = getPoolId(batchData.key);
+                    int24 tickToClean = order.isToken0 ? order.bottomTick : order.topTick;
+                    _cleanupOrderAtTick(poolId, tickToClean, orderId, batchData.key.tickSpacing);
+                }
+
+                // Finally mint total tokens in one go
+                if (batchData.totalToken0Delta > 0) {
+                    poolManager.mint(address(this), batchData.key.currency0.toId(), uint256(batchData.totalToken0Delta));
+                }
+                if (batchData.totalToken1Delta > 0) {
+                    poolManager.mint(address(this), batchData.key.currency1.toId(), uint256(batchData.totalToken1Delta));
+                }
+
+                return "";
+            }
+            // Handle claim callback if added in future
+            else {
+                return "";
+            }
+        }
+        return "";
+    }
+
+    function _cleanupOrderAtTick(bytes32 poolId, int24 tick, bytes32 orderId, int24 tickSpacing) internal {
+        bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
+        for (uint256 i = 0; i < ordersAtTick.length; i++) {
+            if (ordersAtTick[i] == orderId) {
+                ordersAtTick[i] = ordersAtTick[ordersAtTick.length - 1];
+                ordersAtTick.pop();
+                break;
+            }
+        }
+        
+        if (ordersAtTick.length == 0) {
+            _removeTickFromPool(poolId, tick, tickSpacing);
+        }
+    }
     function _storeOrder(
         OrderParams memory params,
         BalanceDelta delta,
@@ -357,6 +458,89 @@ contract LimitOrderHook is BaseHook {
         return (BaseHook.afterSwap.selector, 0);
     }
 
+    function _countValidOrders(
+        bytes32 poolId,
+        int24 oldTick,
+        int24 newTick,
+        int24 tickSpacing,
+        bool zeroForOne
+    ) internal view returns (uint256 totalOrders) {
+        int24 countTick = oldTick;
+        while (zeroForOne ? countTick > newTick : countTick < newTick) {
+            (int24 nextTick, bool hasOrders) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
+                countTick,
+                tickSpacing,
+                zeroForOne
+            );
+            
+            if (hasOrders) {
+                bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
+                for(uint256 j = 0; j < tickOrders.length; j++) {
+                    LimitOrder storage order = limitOrders[tickOrders[j]];
+                    if (!order.executed && order.isToken0 == !zeroForOne) {
+                        totalOrders++;
+                    }
+                }
+            }
+            countTick = nextTick;
+        }
+        return totalOrders;
+    }
+
+    function _getNextTickInfo(
+        bytes32 poolId,
+        int24 tick,
+        int24 tickSpacing,
+        bool zeroForOne
+    ) internal view returns (int24 nextTick, bool hasOrders) {
+        return tickBitmap[poolId].nextInitializedTickWithinOneWord(
+            tick,
+            tickSpacing,
+            zeroForOne
+        );
+    }
+
+    function _processTickOrders(
+        bytes32 poolId,
+        int24 tick,
+        bool zeroForOne,
+        uint256 index,
+        LimitOrder[] memory orders,
+        bytes32[] memory orderIds
+    ) internal view returns (uint256) {
+        bytes32[] storage tickOrders = tickToOrders[poolId][tick];
+        for(uint256 j; j < tickOrders.length;) {
+            if (!limitOrders[tickOrders[j]].executed && limitOrders[tickOrders[j]].isToken0 == !zeroForOne) {
+                orders[index] = limitOrders[tickOrders[j]];
+                orderIds[index++] = tickOrders[j];
+            }
+            unchecked { ++j; }
+        }
+        return index;
+    }
+
+    function _collectOrders(
+        bytes32 poolId,
+        int24 oldTick,
+        int24 newTick,
+        int24 tickSpacing,
+        bool zeroForOne,
+        uint256 totalOrders
+    ) internal view returns (LimitOrder[] memory orders, bytes32[] memory orderIds) {
+        orders = new LimitOrder[](totalOrders);
+        orderIds = new bytes32[](totalOrders);
+        uint256 index;
+        int24 tick = oldTick;
+        bool hasOrders;
+
+        while (zeroForOne ? tick > newTick : tick < newTick) {
+            (tick, hasOrders) = _getNextTickInfo(poolId, tick, tickSpacing, zeroForOne);
+            if (hasOrders) {
+                index = _processTickOrders(poolId, tick, zeroForOne, index, orders, orderIds);
+            }
+        }
+    }
+
     function _processAllTicks(
         bytes32 poolId,
         PoolKey calldata key,
@@ -364,31 +548,35 @@ contract LimitOrderHook is BaseHook {
         int24 newTick,
         bool zeroForOne
     ) internal {
-        int24 processedTick = oldTick;
-        bool initialized = false;
+        uint256 totalOrders = _countValidOrders(
+            poolId,
+            oldTick,
+            newTick,
+            key.tickSpacing,
+            zeroForOne
+        );
 
-        while (zeroForOne ? processedTick > newTick : processedTick < newTick) {
-            (int24 nextTick, bool hasOrders) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
-                processedTick,
+        if (totalOrders > 0) {
+            (LimitOrder[] memory orders, bytes32[] memory orderIds) = _collectOrders(
+                poolId,
+                oldTick,
+                newTick,
                 key.tickSpacing,
-                zeroForOne // true = look left, false = look right
+                zeroForOne,
+                totalOrders
             );
 
-            // If we found a tick with orders
-            if (hasOrders) {
-                bytes32[] storage orderIds = tickToOrders[poolId][nextTick];
-                for(uint256 j = 0; j < orderIds.length; j++) {
-                    LimitOrder storage order = limitOrders[orderIds[j]];
-                    if (!order.executed && order.isToken0 == !zeroForOne) {
-                        _processOrder(key, order, orderIds[j]);
-                    }
-                }
-            }
+            BatchExecuteData memory batchData = BatchExecuteData({
+                key: key,
+                ordersToProcess: orders,
+                orderIds: orderIds,
+                totalToken0Delta: 0,
+                totalToken1Delta: 0
+            });
 
-            processedTick = nextTick;
+            poolManager.unlock(abi.encode(batchData));
         }
     }
-
     function _processOrder(
         PoolKey calldata key,
         LimitOrder storage order,
@@ -449,18 +637,14 @@ contract LimitOrderHook is BaseHook {
     }
 
     function getSqrtPriceFromPrice(uint256 price) internal pure returns (uint160) {
-        if (price == 0) revert InvalidPrice(price);
+        if (price == 0) revert PriceMustBeGreaterThanZero();
         
         // price = token1/token0
         // Convert price to Q96 format first
-        uint256 priceQ96 = FullMath.mulDiv(price, FixedPoint96.Q96, 1);
-        
+        uint256 priceQ96 = FullMath.mulDiv(price, FixedPoint96.Q96, 1 ether); // Since input price is in 1e18 format
+    
         // Take square root using our sqrt function
-        uint256 sqrtPriceX96 = FullMath.mulDiv(
-            sqrt(priceQ96),
-            FixedPoint96.Q96,
-            FixedPoint96.Q96
-        );
+        uint256 sqrtPriceX96 = sqrt(priceQ96) << 48;
         
         if (sqrtPriceX96 > type(uint160).max) revert InvalidPrice(price);
         
@@ -524,7 +708,6 @@ contract LimitOrderHook is BaseHook {
         require(order.executed, "Order not executed");
         require(msg.sender == order.owner, "Not owner");
         
-        // Fix the type mismatch by being explicit about the 0 being int256
         uint256 amount0 = order.token0Delta > int256(0) ? uint256(order.token0Delta) : 0;
         uint256 amount1 = order.token1Delta > int256(0) ? uint256(order.token1Delta) : 0;
         
@@ -546,7 +729,6 @@ contract LimitOrderHook is BaseHook {
             poolManager.take(key.currency1, msg.sender, amount1);
         }
     }
-
 
 }
 
