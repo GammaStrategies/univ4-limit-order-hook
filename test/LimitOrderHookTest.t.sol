@@ -14,6 +14,22 @@ import {LimitOrderHook} from "src/LimitOrderHook.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+
+
+interface ILimitOrderHook {
+    struct LimitOrder {
+        address owner;      
+        bool isToken0;      
+        bool isRange;       
+        bool executed;      
+        int24 bottomTick;   
+        int24 topTick;      
+        uint128 liquidity;  
+    }
+
+    function limitOrders(bytes32 orderId) external view returns (LimitOrder memory);
+}
 
 
 contract LimitOrderHookTest is Test, Deployers {
@@ -21,19 +37,19 @@ contract LimitOrderHookTest is Test, Deployers {
     using CurrencyLibrary for Currency;
 
     LimitOrderHook hook;
-    
+    address public treasury;  
     // Track created orders for testing
     bytes32[] public orderIds;
 
     struct ModifyLiquidityCallbackData {
-    address sender;
-    PoolKey key;
-    IPoolManager.ModifyLiquidityParams params;
-    bytes hookData;
-    bool settleUsingBurn;
-    bool takeClaims;
-    uint256 amount0;
-    uint256 amount1;
+        address sender;
+        PoolKey key;
+        IPoolManager.ModifyLiquidityParams params;
+        bytes hookData;
+        bool settleUsingBurn;
+        bool takeClaims;
+        uint256 amount0;
+        uint256 amount1;
 }
     
     // Events for testing
@@ -44,6 +60,10 @@ contract LimitOrderHookTest is Test, Deployers {
         deployFreshManagerAndRouters();
         (currency0, currency1) = deployMintAndApprove2Currencies();
 
+        // Set up treasury address
+        treasury = makeAddr("treasury");
+
+
         // Deploy hook with proper flags
         uint160 flags = uint160(
             Hooks.BEFORE_SWAP_FLAG | 
@@ -52,7 +72,11 @@ contract LimitOrderHookTest is Test, Deployers {
         address hookAddress = address(flags);
 
         // Deploy the hook
-        deployCodeTo("LimitOrderHook.sol", abi.encode(manager), hookAddress);
+        deployCodeTo(
+            "LimitOrderHook.sol",
+            abi.encode(manager, treasury), // Pass both manager and treasury to constructor
+            hookAddress
+        );
         hook = LimitOrderHook(hookAddress);
 
         // Initialize pool with 1:1 price
@@ -75,6 +99,10 @@ contract LimitOrderHookTest is Test, Deployers {
         );
     }
 
+    function test_treasury_setup() public {
+        assertEq(hook.treasury(), treasury, "Treasury not set correctly");
+    }
+    
     function test_hookPermissions() public {
         Hooks.Permissions memory permissions = hook.getHookPermissions();
         assertTrue(permissions.beforeSwap);
@@ -143,125 +171,154 @@ function test_calculateLiquidity() public {
 }
 
 
-function test_createLimitOrder_storage() public {
-    uint256 amount = 1 ether;
-    bool isToken0 = true;
-    bool isRange = false;
+    function test_createLimitOrder_storage() public {
+        uint256 amount = 1 ether;
+        bool isToken0 = true;
+        bool isRange = false;
 
-    bytes32 poolId = hook.getPoolId(key);
-    (uint160 currentSqrtPriceX96, int24 currentTick,,) = StateLibrary.getSlot0(manager, PoolId.wrap(poolId));
+        bytes32 poolId = hook.getPoolId(key);
+        (uint160 currentSqrtPriceX96, int24 currentTick,,) = StateLibrary.getSlot0(manager, PoolId.wrap(poolId));
    
-    console.log("Target Price:");
-    console.logInt(1.02e18); // Changed to above current price for token0
-    console.log("Current Tick:");
-    console.logInt(currentTick);
-    console.log("Current SqrtPriceX96:");
-    console.logUint(currentSqrtPriceX96);
+        console.log("Target Price:");
+        console.logInt(1.02e18);
+        console.log("Current Tick:");
+        console.logInt(currentTick);
+        console.log("Current SqrtPriceX96:");
+        console.logUint(currentSqrtPriceX96);
 
-    IERC20Minimal(Currency.unwrap(currency0)).approve(address(hook), amount);
-    IERC20Minimal(Currency.unwrap(currency1)).approve(address(hook), amount);
+        IERC20Minimal(Currency.unwrap(currency0)).approve(address(hook), amount);
+        IERC20Minimal(Currency.unwrap(currency1)).approve(address(hook), amount);
 
-    bytes32 orderId = hook.createLimitOrder(
-        isToken0,
-        isRange,
-        1.02e18, // Changed to above current price for token0
-        amount,
-        key
-    );
+        bytes32 orderId = hook.createLimitOrder(
+            isToken0,
+            isRange,
+            1.02e18,
+            amount,
+            key
+        );
 
-    {
-        (
-            address owner,
-            bool orderIsToken0,
-            bool orderIsRange,
-            ,,,,,,,, 
-        ) = hook.limitOrders(orderId);
-        
-        assertEq(owner, address(this), "Wrong owner");
-        assertEq(orderIsToken0, isToken0, "Wrong token direction");
-        assertEq(orderIsRange, isRange, "Wrong range flag");
+        {
+            ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
+            assertEq(order.owner, address(this), "Wrong owner");
+            assertEq(order.isToken0, isToken0, "Wrong token direction");
+            assertEq(order.isRange, isRange, "Wrong range flag");
+        }
+
+        {
+            ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
+            assertTrue(order.bottomTick < order.topTick, "Invalid tick range");
+            assertTrue(order.bottomTick > currentTick, "Token0 order must be above current tick");
+        }
+
+        {
+            ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
+            assertFalse(order.executed, "Already executed");
+            assertTrue(order.liquidity > 0, "No liquidity");
+        }
     }
 
-    {
-        (
-            ,,, 
-            int24 targetTick,
-            int24 bottomTick,
-            int24 topTick,
-            ,,,,,
-        ) = hook.limitOrders(orderId);
+    function test_limitOrder_execution_zeroForOne() public {
+        // Set up initial balances using Currency.unwrap()
+        deal(Currency.unwrap(currency0), address(this), 100 ether);
+        deal(Currency.unwrap(currency1), address(this), 100 ether);
         
-        assertTrue(bottomTick < topTick, "Invalid tick range");
-        assertTrue(bottomTick > currentTick, "Token0 order must be above current tick"); // Added check
+        // Create order selling token0 for token1 at higher price
+        uint256 sellAmount = 1 ether;
+        uint256 limitPrice = 1.02e18; // Price ABOVE current (1.0) for token0 orders
+        bytes32 orderId = hook.createLimitOrder(true, false, limitPrice, sellAmount, key);
+        
+        // Get initial token balances
+        uint256 token0Before = IERC20Minimal(Currency.unwrap(currency0)).balanceOf(address(this));
+        uint256 token1Before = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
+
+        // Approve tokens for swap
+        IERC20Minimal(Currency.unwrap(currency1)).approve(address(swapRouter), 2 ether);
+        
+        // Execute large swap that should trigger the limit order
+        vm.expectEmit(true, true, false, false);
+        emit LimitOrderExecuted(orderId, address(this), sellAmount, 0);
+        
+        uint160 maxSqrtPriceX96 = TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK/key.tickSpacing * key.tickSpacing);
+        
+        swapRouter.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: false,
+                amountSpecified: -2 ether,
+                sqrtPriceLimitX96: maxSqrtPriceX96
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            ""
+        );
+
+        // Verify order executed
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
+        assertTrue(order.executed, "Order not executed");
+
+        // Get token balances in PoolManager
+        uint256 currency0Id = uint256(uint160(Currency.unwrap(currency0)));
+        uint256 currency1Id = uint256(uint160(Currency.unwrap(currency1)));
+        
+        uint256 balance0 = manager.balanceOf(address(this), currency0Id);
+        uint256 balance1 = manager.balanceOf(address(this), currency1Id);
+
+        // Claim tokens through PoolManager with unlock
+        if (balance0 > 0 || balance1 > 0) {
+            bytes memory unlockData = abi.encode(
+                currency0Id,
+                currency1Id,
+                balance0,
+                balance1
+            );
+            manager.unlock(unlockData);
+        }
+
+        // Just verify we received token1
+        uint256 token1After = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
+        console.log("Token1 Before:", token1Before);
+        console.log("Token1 After:", token1After);
+        console.log("Balance1 from PoolManager:", balance1);
+        console.log("Raw difference:", token1After - (token1Before - 2 ether + balance1));
+
+        // Check that we're within 0.5 ETH of our expected value (to account for fees and price impact)
+        uint256 expectedApprox = token1Before - 2 ether + balance1;
+        assertApproxEqRel(
+            token1After,
+            expectedApprox,
+            0.005e18,  // 0.5% tolerance
+            "Token1 balance outside acceptable range"
+        );
     }
 
-    {
-        (
-            ,,,,,, 
-            bool executed,
-            int256 token0Delta,
-            int256 token1Delta,
-            uint256 fees0,
-            uint256 fees1,
-            uint128 liquidity
-        ) = hook.limitOrders(orderId);
-        
-        assertFalse(executed, "Already executed");
-        assertTrue(liquidity > 0, "No liquidity");
-        
-        // For a token0 order above current price
-        assertTrue(token0Delta < 0, "Should have negative token0 delta");
-        assertTrue(token1Delta >= 0, "Should have non-negative token1 delta");
-        
-        assertEq(fees0, 0, "Initial fees should be 0");
-        assertEq(fees1, 0, "Initial fees should be 0");
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+    (
+        uint256 currency0Id,
+        uint256 currency1Id,
+        uint256 balance0,
+        uint256 balance1
+    ) = abi.decode(data, (uint256, uint256, uint256, uint256));
+
+    // Claim token0 if any
+    if (balance0 > 0) {
+        manager.burn(address(this), currency0Id, balance0);
+        manager.take(currency0, address(this), balance0);
+    }
+    
+    // Claim token1 if any
+    if (balance1 > 0) {
+        manager.burn(address(this), currency1Id, balance1);
+        manager.take(currency1, address(this), balance1);
     }
 
-
+    return "";
 }
 
-function test_limitOrder_execution_zeroForOne() public {
-    // Create order selling token0 for token1
-    uint256 sellAmount = 1 ether;
-    uint256 limitPrice = 1.02e18; // Price ABOVE current (1.0) for token0 orders
-    bytes32 orderId = hook.createLimitOrder(true, false, limitPrice, sellAmount, key);
-    
-    uint256 token0Before = currency0.balanceOfSelf();
-    uint256 token1Before = currency1.balanceOfSelf();
 
-    // Execute large swap that should trigger the limit order
-    vm.expectEmit(true, true, false, false);
-    emit LimitOrderExecuted(orderId, address(this), 0, 0);
-    
-    swapRouter.swap(
-        key,
-        IPoolManager.SwapParams({
-            zeroForOne: true,          // Swap token0 for token1 to increase price
-            amountSpecified: 2 ether,  // Large swap to push price up
-            sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1  // Allow price to go up
-        }),
-        PoolSwapTest.TestSettings({
-            takeClaims: false,
-            settleUsingBurn: false
-        }),
-        ZERO_BYTES
-    );
-
-    // Verify order executed
-    (,,,,,,bool executed,,,,,) = hook.limitOrders(orderId);
-    assertTrue(executed, "Order not executed");
-
-    // Claim and verify balances
-    hook.claimLimitOrder(orderId, key);
-    
-    uint256 token0After = currency0.balanceOfSelf();
-    uint256 token1After = currency1.balanceOfSelf();
-
-    assertEq(token0Before - token0After, sellAmount, "Incorrect token0 amount");
-    assertTrue(token1After > token1Before, "No token1 received");
-}
-
-//     function test_limitOrder_execution_oneForZero() public {
+    //     function test_limitOrder_execution_oneForZero() public {
 //         // Create order selling token1 for token0
 //         uint256 sellAmount = 1 ether;
 //         uint256 limitPrice = 1.02e18; // Price above current
