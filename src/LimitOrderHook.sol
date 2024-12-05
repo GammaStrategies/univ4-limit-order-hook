@@ -35,13 +35,12 @@ contract LimitOrderHook is BaseHook {
     struct LimitOrder {
         address owner;      
         bool isToken0;      
-        bool isRange;       
-        bool executed;      
+        bool isRange;         
         int24 bottomTick;   
         int24 topTick;      
         uint128 liquidity;
-        BalanceDelta delta;     // New: Principal amount owed
-        BalanceDelta feeDelta;  // New: Fee amount owed
+        BalanceDelta delta; // Keep only main delta
+        PoolKey key;        // Add PoolKey for claiming
     }
 
     struct AddLiquidityParams {
@@ -214,7 +213,7 @@ function _createOrder(
             amount: amount
         });
 
-        (BalanceDelta delta,) = _addLiquidity(addLiquidityParams);
+        (BalanceDelta delta) = _addLiquidity(addLiquidityParams);
 
         orderId = _storeOrder(params, delta, key);
     }
@@ -338,7 +337,7 @@ function _getValidTickRange(
 
 function _addLiquidity(
     AddLiquidityParams memory params
-) internal returns (BalanceDelta delta, BalanceDelta feeDelta) {
+) internal returns (BalanceDelta delta) {
     // Wrap callback data with type enum
     bytes memory result = poolManager.unlock(
         abi.encode(
@@ -357,25 +356,25 @@ function _addLiquidity(
                         amount1: params.isToken0 ? 0 : params.amount,
                         sender: address(this),
                         hookData: "",
-                        settleUsingBurn: false,
-                        takeClaims: false
+                        settleUsingBurn: true,
+                        takeClaims: true
                     })
                 )
             })
         )
     );
 
-    return abi.decode(result, (BalanceDelta, BalanceDelta));
+    return abi.decode(result, (BalanceDelta));
 }
 
 
 
 
+    // Update _unlockCallback for claiming
     function _unlockCallback(bytes calldata data) internal override returns (bytes memory) {
         UnlockCallbackData memory cbd = abi.decode(data, (UnlockCallbackData));
         
         if (cbd.callbackType == CallbackType.MODIFY_LIQUIDITY) {
-            // Existing modify liquidity logic
             ModifyLiquidityCallbackData memory callbackData = abi.decode(cbd.data, (ModifyLiquidityCallbackData));
             
             if (callbackData.amount0 > 0) {
@@ -385,53 +384,79 @@ function _addLiquidity(
                 callbackData.key.currency1.settle(poolManager, address(this), callbackData.amount1, false);
             }
 
-            (BalanceDelta delta, BalanceDelta feeDelta) = poolManager.modifyLiquidity(
+            (BalanceDelta delta, ) = poolManager.modifyLiquidity(
                 callbackData.key,
                 callbackData.params,
                 callbackData.hookData
             );
 
-            return abi.encode(delta, feeDelta);
+            return abi.encode(delta);
         } else if (cbd.callbackType == CallbackType.CLAIM_ORDER) {
             ClaimOrderCallbackData memory claimData = abi.decode(cbd.data, (ClaimOrderCallbackData));
             LimitOrder storage order = limitOrders[claimData.orderId];
             
-            // Process principal amounts (100% to owner)
-            uint256 amount0 = uint256(int256(order.delta.amount0()));
-            uint256 amount1 = uint256(int256(order.delta.amount1()));
+            uint256 principalAmount;
+            uint256 fees0;
+            uint256 fees1;
             
-            // Process fees (80% to owner, 20% to treasury)
-            uint256 fee0 = uint256(int256(order.feeDelta.amount0()));
-            uint256 fee1 = uint256(int256(order.feeDelta.amount1()));
-            
-            uint256 treasuryFee0 = (fee0 * 20) / 100;
-            uint256 treasuryFee1 = (fee1 * 20) / 100;
-            uint256 ownerFee0 = fee0 - treasuryFee0;
-            uint256 ownerFee1 = fee1 - treasuryFee1;
+            // Calculate principal and fees based on order direction
+            if (order.isToken0) {
+                // For token0->token1 orders, calculate expected token1 from liquidity
+                principalAmount = LiquidityAmounts.getAmount1ForLiquidity(
+                    TickMath.getSqrtPriceAtTick(order.bottomTick),
+                    TickMath.getSqrtPriceAtTick(order.topTick),
+                    order.liquidity
+                );
+                
+                // All token0 received is fees, excess token1 is fees
+                fees0 = uint256(int256(order.delta.amount0()));
+                fees1 = uint256(int256(order.delta.amount1())) - principalAmount;
+            } else {
+                // For token1->token0 orders, calculate expected token0 from liquidity
+                principalAmount = LiquidityAmounts.getAmount0ForLiquidity(
+                    TickMath.getSqrtPriceAtTick(order.bottomTick),
+                    TickMath.getSqrtPriceAtTick(order.topTick),
+                    order.liquidity
+                );
+                
+                // All token1 received is fees, excess token0 is fees
+                fees1 = uint256(int256(order.delta.amount1()));
+                fees0 = uint256(int256(order.delta.amount0())) - principalAmount;
+            }
+
+            // Calculate treasury's share
+            uint256 treasuryFee0 = (fees0 * 20) / 100;
+            uint256 treasuryFee1 = (fees1 * 20) / 100;
+            uint256 ownerFee0 = fees0 - treasuryFee0;
+            uint256 ownerFee1 = fees1 - treasuryFee1;
 
             // Handle token0 transfers
-            if (amount0 > 0 || fee0 > 0) {
-                uint256 currency0Id = uint256(uint160(Currency.unwrap(claimData.key.currency0)));
-                if (amount0 + ownerFee0 > 0) {
-                    poolManager.burn(address(this), currency0Id, amount0 + ownerFee0);
-                    poolManager.take(claimData.key.currency0, order.owner, amount0 + ownerFee0);
+            if (ownerFee0 > 0 || (!order.isToken0 && principalAmount > 0)) {
+                uint256 currency0Id = uint256(uint160(Currency.unwrap(order.key.currency0)));
+                uint256 ownerAmount0 = !order.isToken0 ? (principalAmount + ownerFee0) : ownerFee0;
+                
+                if (ownerAmount0 > 0) {
+                    poolManager.burn(address(this), currency0Id, ownerAmount0);
+                    poolManager.take(order.key.currency0, order.owner, ownerAmount0);
                 }
                 if (treasuryFee0 > 0) {
                     poolManager.burn(address(this), currency0Id, treasuryFee0);
-                    poolManager.take(claimData.key.currency0, treasury, treasuryFee0);
+                    poolManager.take(order.key.currency0, treasury, treasuryFee0);
                 }
             }
 
             // Handle token1 transfers
-            if (amount1 > 0 || fee1 > 0) {
-                uint256 currency1Id = uint256(uint160(Currency.unwrap(claimData.key.currency1)));
-                if (amount1 + ownerFee1 > 0) {
-                    poolManager.burn(address(this), currency1Id, amount1 + ownerFee1);
-                    poolManager.take(claimData.key.currency1, order.owner, amount1 + ownerFee1);
+            if (ownerFee1 > 0 || (order.isToken0 && principalAmount > 0)) {
+                uint256 currency1Id = uint256(uint160(Currency.unwrap(order.key.currency1)));
+                uint256 ownerAmount1 = order.isToken0 ? (principalAmount + ownerFee1) : ownerFee1;
+                
+                if (ownerAmount1 > 0) {
+                    poolManager.burn(address(this), currency1Id, ownerAmount1);
+                    poolManager.take(order.key.currency1, order.owner, ownerAmount1);
                 }
                 if (treasuryFee1 > 0) {
                     poolManager.burn(address(this), currency1Id, treasuryFee1);
-                    poolManager.take(claimData.key.currency1, treasury, treasuryFee1);
+                    poolManager.take(order.key.currency1, treasury, treasuryFee1);
                 }
             }
 
@@ -441,7 +466,6 @@ function _addLiquidity(
             return abi.encode(0);
         }
     }
-
     function _cleanupOrderAtTick(bytes32 poolId, int24 tick, bytes32 orderId, int24 tickSpacing) internal {
         bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
         for (uint256 i = 0; i < ordersAtTick.length; i++) {
@@ -456,32 +480,33 @@ function _addLiquidity(
             _removeTickFromPool(poolId, tick, tickSpacing);
         }
     }
-    function _storeOrder(
-        OrderParams memory params,
-        BalanceDelta delta,
-        PoolKey calldata key
-    ) internal returns (bytes32) {
-        bytes32 poolId = getPoolId(key);
-        bytes32 orderId = keccak256(abi.encode(poolId, msg.sender, block.timestamp));
-        
-        limitOrders[orderId] = LimitOrder({
-            owner: msg.sender,
-            isToken0: params.isToken0,
-            isRange: params.isRange,
-            executed: false,
-            bottomTick: params.bottomTick,
-            topTick: params.topTick,
-            liquidity: params.liquidity,
-            delta: BalanceDelta.wrap(0),    // Initialize with zero delta
-            feeDelta: BalanceDelta.wrap(0)  // Initialize with zero feeDelta
-        });
 
-        int24 storeTick = params.isToken0 ? params.topTick : params.bottomTick;
-        _addTickToPool(poolId, storeTick, key.tickSpacing);
-        tickToOrders[poolId][storeTick].push(orderId);
+function _storeOrder(
+    OrderParams memory params,
+    BalanceDelta delta,
+    PoolKey calldata key
+) internal returns (bytes32) {
+    bytes32 poolId = getPoolId(key);
+    bytes32 orderId = keccak256(abi.encode(poolId, msg.sender, block.timestamp));
+    
+    limitOrders[orderId] = LimitOrder({
+        owner: msg.sender,
+        isToken0: params.isToken0,
+        isRange: params.isRange,
+        bottomTick: params.bottomTick,
+        topTick: params.topTick,
+        liquidity: params.liquidity,
+        delta: BalanceDelta.wrap(0),    // Initialize with zero delta
+        key: key                        // Store the PoolKey
+    });
 
-        return orderId;
-    }
+    int24 storeTick = params.isToken0 ? params.topTick : params.bottomTick;
+    _addTickToPool(poolId, storeTick, key.tickSpacing);
+    tickToOrders[poolId][storeTick].push(orderId);
+
+    return orderId;
+}
+
     function beforeSwap(
         address sender,
         PoolKey calldata key, 
@@ -503,8 +528,8 @@ function afterSwap(
     address sender,
     PoolKey calldata key,
     IPoolManager.SwapParams calldata params,
-    BalanceDelta delta,
-    bytes calldata data
+    BalanceDelta,
+    bytes calldata
 ) external override returns (bytes4, int128) {
     bytes32 poolId = getPoolId(key);
     int24 oldTick = int24(TransientSlot.tload(TransientSlot.asInt256(PREVIOUS_TICK_SLOT)));
@@ -596,7 +621,7 @@ function _executeOrders(
                 bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
                 for(uint256 j = 0; j < tickOrders.length; j++) {
                     LimitOrder storage order = limitOrders[tickOrders[j]];
-                    if (!order.executed && order.isToken0 == !zeroForOne) {
+                    if (order.delta == BalanceDelta.wrap(0) && order.isToken0 == !zeroForOne) {
                         totalOrders++;
                     }
                 }
@@ -635,7 +660,7 @@ function _executeOrders(
                 (tick <= (order.isToken0 ? order.topTick : order.bottomTick)) :  
                 (tick >= (order.isToken0 ? order.topTick : order.bottomTick));
                 
-            if (!order.executed && order.isToken0 == !zeroForOne && validTick) {
+            if (order.delta == BalanceDelta.wrap(0) && order.isToken0 == !zeroForOne && validTick) {
                 orders[index] = limitOrders[tickOrders[j]];
                 orderIds[index++] = tickOrders[j];
             }
@@ -665,51 +690,44 @@ function _executeOrders(
         }
     }
 
-    // Update _processOrder to mint everything to hook and store deltas
-    function _processOrder(
-        PoolKey memory key,
-        LimitOrder storage order,
-        bytes32 orderId
-    ) internal {
-        // Burn the liquidity and get deltas
-        (BalanceDelta delta, BalanceDelta feeDelta) = _burnLimitOrder(key, order, orderId);
-        
-        // Store deltas in order for later claiming
-        order.delta = delta;
-        order.feeDelta = feeDelta;
-        
-        uint256 amount0;
-        uint256 amount1;
-        {
-            int128 delta0 = delta.amount0();
-            int128 delta1 = delta.amount1();
-            if (delta0 > 0) amount0 = uint256(int256(delta0));
-            if (delta1 > 0) amount1 = uint256(int256(delta1));
-        }
+// Update _processOrder to store only delta
+function _processOrder(
+    PoolKey memory key,
+    LimitOrder storage order,
+    bytes32 orderId
+) internal {
+    (BalanceDelta delta, ) = _burnLimitOrder(key, order, orderId);
+    
+    // Store only main delta
+    order.delta = delta;
+    
+    uint256 amount0;
+    uint256 amount1;
 
-        uint256 fee0;
-        uint256 fee1;
-        {
-            int128 fee0Delta = feeDelta.amount0();
-            int128 fee1Delta = feeDelta.amount1();
-            if (fee0Delta > 0) fee0 = uint256(int256(fee0Delta));
-            if (fee1Delta > 0) fee1 = uint256(int256(fee1Delta));
-        }
-
-        // Mint all tokens to the hook contract
-        if (amount0 > 0 || fee0 > 0) {
-            uint256 currency0Id = uint256(uint160(Currency.unwrap(key.currency0)));
-            poolManager.mint(address(this), currency0Id, amount0 + fee0);
-        }
-        
-        if (amount1 > 0 || fee1 > 0) {
-            uint256 currency1Id = uint256(uint160(Currency.unwrap(key.currency1)));
-            poolManager.mint(address(this), currency1Id, amount1 + fee1);
-        }
-
-        emit LimitOrderExecuted(orderId, order.owner, amount0 + fee0, amount1 + fee1);
-        order.executed = true;
+    console.log("delta0:",delta.amount0());
+    console.log("delta1:",delta.amount1());
+    {
+        int128 delta0 = delta.amount0();
+        int128 delta1 = delta.amount1();
+        if (delta0 > 0) amount0 = uint256(int256(delta0));
+        if (delta1 > 0) amount1 = uint256(int256(delta1));
     }
+    console.log("amount0:",amount0);
+    console.log("amount1:",amount1);
+    // Mint tokens to hook for settlement
+    if (amount0 > 0) {
+        uint256 currency0Id = uint256(uint160(Currency.unwrap(key.currency0)));
+        poolManager.mint(address(this), currency0Id, amount0);
+    }
+    if (amount1 > 0) {
+        uint256 currency1Id = uint256(uint160(Currency.unwrap(key.currency1)));
+        poolManager.mint(address(this), currency1Id, amount1);
+    }
+
+    emit LimitOrderExecuted(orderId, order.owner, amount0, amount1);
+
+}
+
 
     function getPoolId(PoolKey memory key) public pure returns (bytes32) {
         return keccak256(abi.encode(
@@ -747,40 +765,41 @@ function _executeOrders(
         return uint160(sqrtPriceX96);
     }
 
-    function _burnLimitOrder(
-        PoolKey memory key,
-        LimitOrder storage order,
-        bytes32 orderId
-    ) internal returns (BalanceDelta delta, BalanceDelta feeDelta) {
-        (delta, feeDelta) = poolManager.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: order.bottomTick,
-                tickUpper: order.topTick,
-                liquidityDelta: -int128(order.liquidity),
-                salt: bytes32(0)
-            }),
-            ""
-        );
+// Update _burnLimitOrder to ignore feeDelta
+function _burnLimitOrder(
+    PoolKey memory key,
+    LimitOrder storage order,
+    bytes32 orderId
+) internal returns (BalanceDelta delta, BalanceDelta) {  // Keep return sig but ignore second return
+    (delta, ) = poolManager.modifyLiquidity(
+        key,
+        IPoolManager.ModifyLiquidityParams({
+            tickLower: order.bottomTick,
+            tickUpper: order.topTick,
+            liquidityDelta: -int128(order.liquidity),
+            salt: bytes32(0)
+        }),
+        ""
+    );
 
-        bytes32 poolId = getPoolId(key);
-        int24 tickToClean = order.isToken0 ? order.topTick : order.bottomTick;
-        
-        bytes32[] storage ordersAtTick = tickToOrders[poolId][tickToClean];
-        for (uint256 i = 0; i < ordersAtTick.length; i++) {
-            if (ordersAtTick[i] == orderId) {
-                ordersAtTick[i] = ordersAtTick[ordersAtTick.length - 1];
-                ordersAtTick.pop();
-                break;
-            }
+    bytes32 poolId = getPoolId(key);
+    int24 tickToClean = order.isToken0 ? order.topTick : order.bottomTick;
+    
+    bytes32[] storage ordersAtTick = tickToOrders[poolId][tickToClean];
+    for (uint256 i = 0; i < ordersAtTick.length; i++) {
+        if (ordersAtTick[i] == orderId) {
+            ordersAtTick[i] = ordersAtTick[ordersAtTick.length - 1];
+            ordersAtTick.pop();
+            break;
         }
-        
-        if (ordersAtTick.length == 0) {
-            _removeTickFromPool(poolId, tickToClean, key.tickSpacing);
-        }
-
-        order.executed = true;
     }
+    
+    if (ordersAtTick.length == 0) {
+        _removeTickFromPool(poolId, tickToClean, key.tickSpacing);
+    }
+
+    return (delta, BalanceDelta.wrap(0));  // Return dummy second value
+}
 
     function _addTickToPool(bytes32 poolId, int24 tick, int24 tickSpacing) internal {
         tickBitmap[poolId].flipTick(tick, tickSpacing);
@@ -793,7 +812,7 @@ function _executeOrders(
     // Add claim function
     function claimOrder(bytes32 orderId, PoolKey calldata key) external {
         LimitOrder storage order = limitOrders[orderId];
-        require(order.executed, "Order not executed");
+        require(order.delta != BalanceDelta.wrap(0), "Order not executed"); 
         require(msg.sender == order.owner, "Not owner");
 
         // Call unlock with CLAIM_ORDER

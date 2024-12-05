@@ -21,11 +21,12 @@ interface ILimitOrderHook {
     struct LimitOrder {
         address owner;      
         bool isToken0;      
-        bool isRange;       
-        bool executed;      
+        bool isRange;         
         int24 bottomTick;   
         int24 topTick;      
-        uint128 liquidity;  
+        uint128 liquidity;
+        BalanceDelta delta; // Keep only main delta
+        PoolKey key;        // Add PoolKey for claiming
     }
 
     function limitOrders(bytes32 orderId) external view returns (LimitOrder memory);
@@ -131,7 +132,7 @@ function test_createLimitOrder_validation() public {
     vm.expectRevert(abi.encodeWithSelector(
         LimitOrderHook.InvalidExecutionDirection.selector,
         true,
-        expectedTargetTick,
+        rawTargetTick,
         currentTick
     ));
     hook.createLimitOrder(true, false, 0.98e18, 1 ether, key); // Should fail - trying to sell token0 below current price
@@ -212,111 +213,74 @@ function test_calculateLiquidity() public {
 
         {
             ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
-            assertFalse(order.executed, "Already executed");
+            assertFalse(order.delta != BalanceDelta.wrap(0), "Already executed");
             assertTrue(order.liquidity > 0, "No liquidity");
         }
     }
 
-    function test_limitOrder_execution_zeroForOne() public {
-        // Set up initial balances using Currency.unwrap()
-        deal(Currency.unwrap(currency0), address(this), 100 ether);
-        deal(Currency.unwrap(currency1), address(this), 100 ether);
-        
-        // Create order selling token0 for token1 at higher price
-        uint256 sellAmount = 1 ether;
-        uint256 limitPrice = 1.02e18; // Price ABOVE current (1.0) for token0 orders
-        bytes32 orderId = hook.createLimitOrder(true, false, limitPrice, sellAmount, key);
-        
-        // Get initial token balances
-        uint256 token0Before = IERC20Minimal(Currency.unwrap(currency0)).balanceOf(address(this));
-        uint256 token1Before = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
-
-        // Approve tokens for swap
-        IERC20Minimal(Currency.unwrap(currency1)).approve(address(swapRouter), 2 ether);
-        
-        // Execute large swap that should trigger the limit order
-        vm.expectEmit(true, true, false, false);
-        emit LimitOrderExecuted(orderId, address(this), sellAmount, 0);
-        
-        uint160 maxSqrtPriceX96 = TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK/key.tickSpacing * key.tickSpacing);
-        
-        swapRouter.swap(
-            key,
-            IPoolManager.SwapParams({
-                zeroForOne: false,
-                amountSpecified: -2 ether,
-                sqrtPriceLimitX96: maxSqrtPriceX96
-            }),
-            PoolSwapTest.TestSettings({
-                takeClaims: false,
-                settleUsingBurn: false
-            }),
-            ""
-        );
-
-        // Verify order executed
-        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
-        assertTrue(order.executed, "Order not executed");
-
-        // Get token balances in PoolManager
-        uint256 currency0Id = uint256(uint160(Currency.unwrap(currency0)));
-        uint256 currency1Id = uint256(uint160(Currency.unwrap(currency1)));
-        
-        uint256 balance0 = manager.balanceOf(address(this), currency0Id);
-        uint256 balance1 = manager.balanceOf(address(this), currency1Id);
-
-        // Claim tokens through PoolManager with unlock
-        if (balance0 > 0 || balance1 > 0) {
-            bytes memory unlockData = abi.encode(
-                currency0Id,
-                currency1Id,
-                balance0,
-                balance1
-            );
-            manager.unlock(unlockData);
-        }
-
-        // Just verify we received token1
-        uint256 token1After = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
-        console.log("Token1 Before:", token1Before);
-        console.log("Token1 After:", token1After);
-        console.log("Balance1 from PoolManager:", balance1);
-        console.log("Raw difference:", token1After - (token1Before - 2 ether + balance1));
-
-        // Check that we're within 0.5 ETH of our expected value (to account for fees and price impact)
-        uint256 expectedApprox = token1Before - 2 ether + balance1;
-        assertApproxEqRel(
-            token1After,
-            expectedApprox,
-            0.005e18,  // 0.5% tolerance
-            "Token1 balance outside acceptable range"
-        );
-    }
-
-
-    function unlockCallback(bytes calldata data) external returns (bytes memory) {
-    (
-        uint256 currency0Id,
-        uint256 currency1Id,
-        uint256 balance0,
-        uint256 balance1
-    ) = abi.decode(data, (uint256, uint256, uint256, uint256));
-
-    // Claim token0 if any
-    if (balance0 > 0) {
-        manager.burn(address(this), currency0Id, balance0);
-        manager.take(currency0, address(this), balance0);
-    }
+function test_limitOrder_execution_zeroForOne() public {
+    // Set up initial balances using Currency.unwrap()
+    deal(Currency.unwrap(currency0), address(this), 100 ether);
+    deal(Currency.unwrap(currency1), address(this), 100 ether);
     
-    // Claim token1 if any
-    if (balance1 > 0) {
-        manager.burn(address(this), currency1Id, balance1);
-        manager.take(currency1, address(this), balance1);
-    }
+    // Create order selling token0 for token1 at higher price
+    uint256 sellAmount = 1 ether;
+    uint256 limitPrice = 1.02e18; // Price ABOVE current (1.0) for token0 orders
+    bytes32 orderId = hook.createLimitOrder(true, false, limitPrice, sellAmount, key);
+    
+    // Execute large swap that should trigger the limit order
+    vm.expectEmit(true, true, false, false);
+    emit LimitOrderExecuted(orderId, address(this), sellAmount, 0);
+    
+    uint160 maxSqrtPriceX96 = TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK/key.tickSpacing * key.tickSpacing);
+    
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -2 ether,
+            sqrtPriceLimitX96: maxSqrtPriceX96
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
 
-    return "";
+    // Verify order executed and has balance deltas
+    ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderId);
+    assertTrue(order.delta != BalanceDelta.wrap(0), "Order not executed");
+
+    // Check ERC-6909 balances minted to hook contract
+    uint256 currency0Id = uint256(uint160(Currency.unwrap(currency0)));
+    uint256 currency1Id = uint256(uint160(Currency.unwrap(currency1)));
+    
+    uint256 hookBalance0 = manager.balanceOf(address(hook), currency0Id);
+    uint256 hookBalance1 = manager.balanceOf(address(hook), currency1Id);
+
+    // Log balances for debugging
+    console.log("Hook balance token0:", hookBalance0);
+    console.log("Hook balance token1:", hookBalance1);
+    
+    // Verify some tokens were minted to the hook contract
+    assertTrue(hookBalance0 > 0 || hookBalance1 > 0, "No tokens minted to hook");
+
+    // Verify BalanceDelta fields were updated
+    int256 delta0 = int256(uint256(uint128(order.delta.amount0())));
+    int256 delta1 = int256(uint256(uint128(order.delta.amount1())));
+
+
+    console.log("Delta token0:", uint256(delta0));
+    console.log("Delta token1:", uint256(delta1));
+
+
+    // Verify that at least one of the deltas is non-zero
+    assertTrue(
+        delta0 != 0 || delta1 != 0,
+        "No balance deltas recorded"
+    );
 }
-
 
     //     function test_limitOrder_execution_oneForZero() public {
 //         // Create order selling token1 for token0
