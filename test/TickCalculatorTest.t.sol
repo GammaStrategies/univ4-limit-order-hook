@@ -171,4 +171,30 @@ contract TickCalculatorTest_Test is Test {
         console.log("Top Tick (current):", topTick);
         console.log("Range Size in Ticks:", topTick - bottomTick);
     }
+
+    function testSpecificToken1RangeCase() public {
+        console.log("\nTesting Specific Token1 Range Case");
+        
+        // Convert targetTick 60 to a price
+        uint160 targetSqrtPrice = calculator.getPriceFromTick(60);
+        // Convert sqrt price to regular price (need to square it and convert from Q96)
+        uint256 targetPrice = uint256(targetSqrtPrice) * uint256(targetSqrtPrice) * 1e18 / (1 << 192);
+        
+        console.log("Current Tick: 1");
+        console.log("Target Price (derived from tick 60):", targetPrice);
+        
+        (int24 bottomTick, int24 topTick, uint160 sqrtPriceX96, int24 rawTargetTick) = 
+            calculator.calculateTicks(
+                false,  // isToken0
+                true,   // isRange
+                targetPrice,
+                1,      // currentTick
+                60      // tickSpacing
+            );
+            
+        console.log("Bottom Tick:", bottomTick);    // Should be -60
+        console.log("Top Tick:", topTick);          // Should be 0
+        console.log("Raw Target Tick:", rawTargetTick);
+        console.log("Range Size in Ticks:", topTick - bottomTick);  // Should be 60
+    }
 }

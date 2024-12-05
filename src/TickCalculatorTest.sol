@@ -45,8 +45,14 @@ function _getValidTickRange(
     // Round target tick based on token direction
     if (isToken0) {
         // For token0 orders, round down to nearest valid tick spacing
+        if (targetTick <= currentTick) {
+            revert InvalidExecutionDirection(true, targetTick, currentTick);
+        }
         targetTick = (targetTick / tickSpacing) * tickSpacing;
     } else {
+        if (targetTick >= currentTick) {
+            revert InvalidExecutionDirection(false, targetTick, currentTick);
+        }
         // For token1 orders, round down to the nearest valid tick spacing greater than or equal to targetTick
         targetTick = (targetTick / tickSpacing) * tickSpacing;
         if (targetTick > (targetTick / tickSpacing) * tickSpacing) {
