@@ -160,8 +160,8 @@ function _createOrder(
     uint256 amount,
     PoolKey calldata key
 ) internal returns (bytes32 orderId) {
-    if (price == 0) revert PriceMustBeGreaterThanZero();
-    if (amount == 0) revert AmountTooLow();
+    require(amount > 0, "AmountTooLow");
+    require(price > 0, "PriceMustBeGreaterThanZero");
 
     // Get current pool state
     (, int24 currentTick,,) = StateLibrary.getSlot0(
@@ -219,6 +219,49 @@ function _createOrder(
     }
 
     return orderId;
+}
+
+function _addOrderToTick(
+    bytes32 poolId,
+    bytes32 orderId,
+    int24 tick,
+    IPoolManager manager
+) internal {
+    // Check if any orders exist at this tick
+    bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
+    bool hasExistingOrders = ordersAtTick.length > 0;
+
+    // Add the order
+    ordersAtTick.push(orderId);
+
+    // Only flip if this is the first order at this tick
+    if (!hasExistingOrders) {
+        PoolId id = PoolId.wrap(poolId);
+        manager.updateTick(id, tick);
+    }
+}
+
+function _removeOrderFromTick(
+    bytes32 poolId,
+    int24 tick,
+    IPoolManager manager
+) internal {
+    bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
+    
+    // Check remaining unexecuted orders
+    bool hasUnexecutedOrders = false;
+    for (uint256 i = 0; i < ordersAtTick.length; i++) {
+        if (limitOrders[ordersAtTick[i]].delta == BalanceDelta.wrap(0)) {
+            hasUnexecutedOrders = true;
+            break;
+        }
+    }
+
+    // Only flip the bit back if no unexecuted orders remain
+    if (!hasUnexecutedOrders) {
+        PoolId id = PoolId.wrap(poolId);
+        manager.updateTick(id, tick);
+    }
 }
 
     function _calculateTicks(
@@ -814,43 +857,25 @@ function _countValidOrders(
 ) internal view returns (uint256 totalOrders) {
     console.log("Old Tick:", oldTick);
     console.log("to New TIck: ", newTick);
-    console.log("Direction zeroForOne:", zeroForOne);
-
-    oldTick = oldTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
-              oldTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : oldTick;
-    newTick = newTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
-              newTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : newTick;
     
     TraversalState memory state;
-    state.currentTick = (oldTick / tickSpacing) * tickSpacing;
+    state.currentTick = ((oldTick >> 8) << 8) / tickSpacing * tickSpacing;  // Compressed word boundary calc
     state.lastFoundTick = zeroForOne ? TickMath.MAX_TICK : TickMath.MIN_TICK;
     
-    while (true) {
-        state.iterations++;
-        if (state.iterations > 100) {
-            console.log("Breaking after 100 iterations");
-            break;
-        }
-
-        (int24 nextTick, bool initialized) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
+    while (state.iterations++ < 100) {
+        int24 nextTick;
+        bool initialized;
+        (nextTick, initialized) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
             state.currentTick,
             tickSpacing,
             zeroForOne
         );
 
-        console.log("Found tick:", nextTick);
-        console.log("initialized:", initialized);
-
         bool shouldBreak = zeroForOne ? 
-            (nextTick <= newTick || nextTick >= state.lastFoundTick) :
-            (nextTick >= newTick || nextTick <= state.lastFoundTick);
+            (nextTick <= newTick || nextTick >= state.lastFoundTick || nextTick <= state.currentTick) :
+            (nextTick >= newTick || nextTick <= state.lastFoundTick || nextTick <= state.currentTick);
 
-        if (shouldBreak) {
-            console.log("Breaking - nextTick:", nextTick);
-            console.log("newTick:", newTick);
-            console.log("lastFoundTick:", state.lastFoundTick);
-            break;
-        }
+        if (shouldBreak) break;
 
         state.lastFoundTick = nextTick;
 
@@ -859,10 +884,8 @@ function _countValidOrders(
         }
 
         state.currentTick = nextTick + (zeroForOne ? -tickSpacing : tickSpacing);
-        console.log("Moving to tick:", state.currentTick);
     }
     
-    console.log("Total valid orders found:", state.totalOrders);
     return state.totalOrders;
 }
 function _processTickOrders(
@@ -906,6 +929,7 @@ function _processTickOrders(
     }
     return index;
 }
+
 struct OrderTraversalState {
     uint256 index;
     int24 currentTick;

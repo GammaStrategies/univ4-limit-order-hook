@@ -532,9 +532,64 @@ ILimitOrderHook.LimitOrder memory order2 = ILimitOrderHook(address(hook)).limitO
 assertTrue(order2.delta != BalanceDelta.wrap(0), "Order 2 (3.0x) not executed");
 } 
  
- 
- 
-    //     function test_limitOrder_execution_oneForZero() public {
+function test_afterSwap_gas_limits() public {
+    uint256 BATCH_SIZE = 51;
+    
+    deal(Currency.unwrap(currency0), address(this), 1000000 ether);
+    deal(Currency.unwrap(currency1), address(this), 1000000 ether);
+
+    bytes32[] memory orderIds = new bytes32[](BATCH_SIZE);
+    uint256 orderCreationGas = 0;
+    
+    // Create orders
+    for(uint256 i = 0; i < BATCH_SIZE; i++) {
+        uint256 gasBefore = gasleft();
+        orderIds[i] = hook.createLimitOrder(
+            true,
+            false,
+            1.02e18,  // Fixed price point above 1.0
+            0.1 ether,
+            key
+        );
+        orderCreationGas += gasBefore - gasleft();
+    }
+    
+    console.log("Total creation gas: %s", orderCreationGas);
+    console.log("Average creation gas per order: %s", orderCreationGas / BATCH_SIZE);
+    
+    // Execute swap
+    uint256 swapGasBefore = gasleft();
+    
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -50 ether,
+            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+    
+    uint256 swapGasUsed = swapGasBefore - gasleft();
+    console.log("Swap gas used: %s", swapGasUsed);
+    console.log("Average gas per order in swap: %s", swapGasUsed / BATCH_SIZE);
+    
+    // Verify executions
+    uint256 executedOrders = 0;
+    for(uint256 i = 0; i < BATCH_SIZE; i++) {
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderIds[i]);
+        if(order.delta != BalanceDelta.wrap(0)) {
+            executedOrders++;
+        }
+    }
+    
+    console.log("Orders executed: %s/%s", executedOrders, BATCH_SIZE);
+    console.log("Total gas used: %s", orderCreationGas + swapGasUsed);
+}
 //         // Create order selling token1 for token0
 //         uint256 sellAmount = 1 ether;
 //         uint256 limitPrice = 1.02e18; // Price above current
