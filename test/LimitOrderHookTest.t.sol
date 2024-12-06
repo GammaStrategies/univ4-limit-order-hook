@@ -381,7 +381,7 @@ function test_multiple_limit_orders_same_tick() public {
         key,
         IPoolManager.SwapParams({
             zeroForOne: false,
-            amountSpecified: -4 ether,  // Reduced amount for 3 orders
+            amountSpecified: -40 ether,  // Reduced amount for 3 orders
             sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
         }),
         PoolSwapTest.TestSettings({
