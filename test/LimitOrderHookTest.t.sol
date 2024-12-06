@@ -15,7 +15,8 @@ import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
-
+import {FullMath} from "v4-core/libraries/FullMath.sol";
+import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 
 interface ILimitOrderHook {
     struct LimitOrder {
@@ -282,6 +283,257 @@ function test_limitOrder_execution_zeroForOne() public {
     );
 }
 
+function test_claim_limit_order() public {
+    // Set up initial balances
+    deal(Currency.unwrap(currency0), address(this), 100 ether);
+    deal(Currency.unwrap(currency1), address(this), 100 ether);
+    
+    // Create order selling token0 for token1 at higher price
+    uint256 sellAmount = 1 ether;
+    uint256 limitPrice = 1.02e18; // Price ABOVE current (1.0) for token0 orders
+    bytes32 orderId = hook.createLimitOrder(true, false, limitPrice, sellAmount, key);
+    
+    // DEBUG: Check the order owner immediately after creation
+    ILimitOrderHook.LimitOrder memory orderAfterCreation = ILimitOrderHook(address(hook)).limitOrders(orderId);
+    console.log("Order owner:", orderAfterCreation.owner);
+    console.log("Test contract address:", address(this));
+    
+    // Execute large swap that should trigger the limit order
+    uint160 maxSqrtPriceX96 = TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK/key.tickSpacing * key.tickSpacing);
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -2 ether,
+            sqrtPriceLimitX96: maxSqrtPriceX96
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+
+    // DEBUG: Check the order owner before claiming
+    ILimitOrderHook.LimitOrder memory orderBeforeClaim = ILimitOrderHook(address(hook)).limitOrders(orderId);
+    console.log("Order owner before claim:", orderBeforeClaim.owner);
+    console.log("Order executed status:", orderBeforeClaim.delta != BalanceDelta.wrap(0));
+    
+    // Try to claim
+    hook.claimOrder(orderId, key);
+}
+
+function test_multiple_limit_orders_same_tick() public {
+    // Deal substantial tokens to test contract and approve
+    deal(Currency.unwrap(currency0), address(this), 1000 ether);
+    deal(Currency.unwrap(currency1), address(this), 1000 ether);
+
+    // Add initial liquidity first (same as before)
+    modifyLiquidityRouter.modifyLiquidity(
+        key,
+        IPoolManager.ModifyLiquidityParams({
+            tickLower: TickMath.minUsableTick(60),
+            tickUpper: TickMath.maxUsableTick(60),
+            liquidityDelta: 100 ether,
+            salt: bytes32(0)
+        }),
+        ZERO_BYTES
+    );
+
+    // Track orders for verification
+    bytes32[] memory newOrderIds = new bytes32[](3);
+    
+    // Create just 3 limit orders at same price point
+    uint256 limitPrice = 1.02e18;
+    uint256 orderAmount = 0.5 ether;
+    
+    console.log("Creating 3 limit orders...");
+    
+    bytes32 poolId = hook.getPoolId(key);
+    (,int24 currentTick,,) = StateLibrary.getSlot0(
+        manager,
+        PoolId.wrap(poolId)
+    );
+    console.log("Current tick before orders:", currentTick);
+    
+    for(uint i = 0; i < 3; i++) {
+        newOrderIds[i] = hook.createLimitOrder(
+            true,    // selling token0
+            false,   // not range order
+            limitPrice,
+            orderAmount,
+            key
+        );
+        
+        // Log the order details
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[i]);
+        console.log("Order", i, "created:");
+        console.log(" - Bottom tick:", order.bottomTick);
+        console.log(" - Top tick:", order.topTick);
+        console.log(" - Liquidity:", order.liquidity);
+    }
+
+    // Execute large swap that should trigger all orders
+    console.log("\nExecuting swap...");
+    console.log("Current tick before swap:", currentTick);
+
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -4 ether,  // Reduced amount for 3 orders
+            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+
+    // Get tick after swap
+    (,int24 newTick,,) = StateLibrary.getSlot0(
+        manager,
+        PoolId.wrap(poolId)
+    );
+    console.log("Current tick after swap:", newTick);
+
+    // Check each order's execution status
+    for(uint i = 0; i < 3; i++) {
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[i]);
+        console.log("Order", i, "execution status:");
+        console.log(" - Delta is non-zero:", order.delta != BalanceDelta.wrap(0));
+        console.log(" - Delta amount0:", uint256(uint128(order.delta.amount0())));
+        console.log(" - Delta amount1:", uint256(uint128(order.delta.amount1())));
+    }
+}
+ 
+function test_multiple_limit_order_types() public {
+    // Deal tokens
+    deal(Currency.unwrap(currency0), address(this), 1000 ether);
+    deal(Currency.unwrap(currency1), address(this), 1000 ether);
+
+    // Add initial liquidity for price movement
+    modifyLiquidityRouter.modifyLiquidity(
+        key,
+        IPoolManager.ModifyLiquidityParams({
+            tickLower: TickMath.minUsableTick(60),
+            tickUpper: TickMath.maxUsableTick(60),
+            liquidityDelta: 100 ether,
+            salt: bytes32(0)
+        }),
+        ZERO_BYTES
+    );
+
+    // Track orders
+    bytes32[] memory newOrderIds = new bytes32[](3);
+
+    bytes32 poolId = hook.getPoolId(key);
+    (,int24 currentTick,,) = StateLibrary.getSlot0(
+        manager,
+        PoolId.wrap(poolId)
+    );
+    console.log("Current tick before orders:", currentTick);
+
+    // Create and store orderId for first order at 1.5x
+    console.log("\nCreating Order 0: Regular limit at 1.5x");
+    newOrderIds[0] = hook.createLimitOrder(
+        true,    // selling token0
+        false,   // not range order
+        1.5e18,  // price
+        0.5 ether,
+        key
+    );
+    {  
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[0]);
+        console.log("Order 0 created:");
+        console.log(" - Is Range:", order.isRange);
+        console.log(" - Bottom tick:", order.bottomTick);
+        console.log(" - Top tick:", order.topTick);
+        console.log(" - Liquidity:", order.liquidity);
+    }
+
+    // Create and store orderId for second order at 2.0x
+    console.log("\nCreating Order 1: Range order at 2.0x");
+    newOrderIds[1] = hook.createLimitOrder(
+        true,    // selling token0
+        true,    // range order
+        2e18,    // price
+        0.5 ether,
+        key
+    );
+    {  
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[1]);
+        console.log("Order 1 created:");
+        console.log(" - Is Range:", order.isRange);
+        console.log(" - Bottom tick:", order.bottomTick);
+        console.log(" - Top tick:", order.topTick);
+        console.log(" - Liquidity:", order.liquidity);
+    }
+
+    // Create and store orderId for third order at 3.0x
+    console.log("\nCreating Order 2: Regular limit at 3.0x");
+    newOrderIds[2] = hook.createLimitOrder(
+        true,     // selling token0
+        false,    // not range order
+        3e18,     // price
+        0.5 ether,
+        key
+    );
+    {  
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[2]);
+        console.log("Order 2 created:");
+        console.log(" - Is Range:", order.isRange);
+        console.log(" - Bottom tick:", order.bottomTick);
+        console.log(" - Top tick:", order.topTick);
+        console.log(" - Liquidity:", order.liquidity);
+    }
+    // Execute large swap that should trigger all orders
+    console.log("\nExecuting swap to trigger all orders...");
+    console.log("Current tick before swap:", currentTick);
+
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: false,  // Swapping token1 for token0
+            amountSpecified: -80 ether,  // Large swap to cross all prices up to 3x
+            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+
+    // Get tick after swap
+    (,int24 newTick,,) = StateLibrary.getSlot0(
+        manager,
+        PoolId.wrap(poolId)
+    );
+    console.log("Current tick after swap:", newTick);
+    
+    // Calculate and display actual price after swap
+    uint160 sqrtPriceX96 = uint160(TickMath.getSqrtPriceAtTick(newTick));
+    uint256 priceAfterX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, FixedPoint96.Q96);
+    uint256 priceAfter = FullMath.mulDiv(priceAfterX96, 1e18, FixedPoint96.Q96);
+    console.log("Price after swap:", priceAfter);
+
+// Verify order 0 (1.5x) was executed
+ILimitOrderHook.LimitOrder memory order0 = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[0]);
+assertTrue(order0.delta != BalanceDelta.wrap(0), "Order 0 (1.5x) not executed");
+
+// Verify order 1 (2.0x range) was executed
+ILimitOrderHook.LimitOrder memory order1 = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[1]);
+assertTrue(order1.delta != BalanceDelta.wrap(0), "Order 1 (2.0x range) not executed");
+
+// Verify order 2 (3.0x) was executed 
+ILimitOrderHook.LimitOrder memory order2 = ILimitOrderHook(address(hook)).limitOrders(newOrderIds[2]);
+assertTrue(order2.delta != BalanceDelta.wrap(0), "Order 2 (3.0x) not executed");
+} 
+ 
+ 
+ 
     //     function test_limitOrder_execution_oneForZero() public {
 //         // Create order selling token1 for token0
 //         uint256 sellAmount = 1 ether;

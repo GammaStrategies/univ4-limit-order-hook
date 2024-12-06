@@ -480,6 +480,9 @@ function _addLiquidity(
             _removeTickFromPool(poolId, tick, tickSpacing);
         }
     }
+// Add at contract level
+uint256 private orderNonce;
+
 
 function _storeOrder(
     OrderParams memory params,
@@ -487,7 +490,7 @@ function _storeOrder(
     PoolKey calldata key
 ) internal returns (bytes32) {
     bytes32 poolId = getPoolId(key);
-    bytes32 orderId = keccak256(abi.encode(poolId, msg.sender, block.timestamp));
+    bytes32 orderId = keccak256(abi.encode(poolId, msg.sender, block.timestamp, orderNonce++));
     
     limitOrders[orderId] = LimitOrder({
         owner: msg.sender,
@@ -602,34 +605,48 @@ function _executeOrders(
     }
 }
 
-    function _countValidOrders(
-        bytes32 poolId,
-        int24 oldTick,
-        int24 newTick,
-        int24 tickSpacing,
-        bool zeroForOne
-    ) internal view returns (uint256 totalOrders) {
-        int24 countTick = oldTick;
-        while (zeroForOne ? countTick > newTick : countTick < newTick) {
-            (int24 nextTick, bool hasOrders) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
-                countTick,
-                tickSpacing,
-                zeroForOne
-            );
-            
-            if (hasOrders) {
-                bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
-                for(uint256 j = 0; j < tickOrders.length; j++) {
-                    LimitOrder storage order = limitOrders[tickOrders[j]];
-                    if (order.delta == BalanceDelta.wrap(0) && order.isToken0 == !zeroForOne) {
-                        totalOrders++;
-                    }
-                }
-            }
-            countTick = nextTick;
-        }
-        return totalOrders;
-    }
+// function _countValidOrders(
+//     bytes32 poolId,
+//     int24 oldTick,
+//     int24 newTick,
+//     int24 tickSpacing,
+//     bool zeroForOne
+// ) internal view returns (uint256 totalOrders) {
+//     int24 countTick = oldTick;
+    
+//     while (zeroForOne ? countTick > newTick : countTick < newTick) {
+//         (int24 nextTick, bool hasOrders) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
+//             countTick,
+//             tickSpacing,
+//             zeroForOne
+//         );
+        
+//         if (hasOrders) {
+//             bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
+//             for(uint256 j = 0; j < tickOrders.length; j++) {
+//                 LimitOrder storage order = limitOrders[tickOrders[j]];
+//                 // Check if order is unexecuted (delta == 0)
+//                 if (order.delta == BalanceDelta.wrap(0)) {
+//                     if (zeroForOne) {
+//                         // zeroForOne = true means token0->token1 swaps (price going down)
+//                         // and newTick must be strictly less than bottomTick to execute the token1 orders
+//                         if (!order.isToken0 && newTick < order.bottomTick) {
+//                             totalOrders++;
+//                         }
+//                     } else {
+//                         // zeroForOne = false means token1->token0 swaps (price going up)
+//                         // and topTick must be less than or equal to newTick to execute the token0 orders
+//                         if (order.isToken0 && order.topTick <= newTick) {
+//                             totalOrders++;
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//         countTick = nextTick;
+//     }
+//     return totalOrders;
+// }
 
     function _getNextTickInfo(
         bytes32 poolId,
@@ -644,51 +661,358 @@ function _executeOrders(
         );
     }
 
-    function _processTickOrders(
-        bytes32 poolId,
-        int24 tick,
-        bool zeroForOne,
-        uint256 index,
-        LimitOrder[] memory orders,
-        bytes32[] memory orderIds
-    ) internal view returns (uint256) {
-        bytes32[] storage tickOrders = tickToOrders[poolId][tick];
-        for(uint256 j; j < tickOrders.length;) {
-            LimitOrder storage order = limitOrders[tickOrders[j]];
-            // Add tick validation
-            bool validTick = zeroForOne ? 
-                (tick <= (order.isToken0 ? order.topTick : order.bottomTick)) :  
-                (tick >= (order.isToken0 ? order.topTick : order.bottomTick));
-                
-            if (order.delta == BalanceDelta.wrap(0) && order.isToken0 == !zeroForOne && validTick) {
+
+
+// function _countValidOrders(
+//     bytes32 poolId,
+//     int24 oldTick,
+//     int24 newTick,
+//     int24 tickSpacing,
+//     bool zeroForOne
+// ) internal view returns (uint256 totalOrders) {
+//     // Ensure we're within valid tick range
+//     oldTick = oldTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
+//               oldTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : oldTick;
+//     newTick = newTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
+//               newTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : newTick;
+    
+//     // Align start tick with spacing
+//     oldTick = (oldTick / tickSpacing) * tickSpacing;
+    
+//     int24 currentTick = oldTick;
+    
+//     // Track the last found tick to avoid infinite loops
+//     int24 lastFoundTick = zeroForOne ? TickMath.MAX_TICK : TickMath.MIN_TICK;
+    
+//     while (true) {
+//         (int24 nextTick, bool initialized) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
+//             currentTick,
+//             tickSpacing,
+//             zeroForOne
+//         );
+
+//         // Break if we've reached or crossed the target tick
+//         if (zeroForOne) {
+//             if (nextTick <= newTick || nextTick >= lastFoundTick) break;
+//             lastFoundTick = nextTick;
+//         } else {
+//             if (nextTick >= newTick || nextTick <= lastFoundTick) break;
+//             lastFoundTick = nextTick;
+//         }
+
+//         if (initialized) {
+//             bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
+//             for (uint256 i = 0; i < tickOrders.length; i++) {
+//                 LimitOrder storage order = limitOrders[tickOrders[i]];
+//                 if (order.delta == BalanceDelta.wrap(0)) {
+//                     if (zeroForOne) {
+//                         if (!order.isToken0 && newTick < order.bottomTick) {
+//                             totalOrders++;
+//                         }
+//                     } else {
+//                         if (order.isToken0 && order.topTick <= newTick) {
+//                             totalOrders++;
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+
+//         // Move to next tick
+//         currentTick = nextTick + (zeroForOne ? -tickSpacing : tickSpacing);
+//     }
+    
+//     return totalOrders;
+// }
+
+// function _processTickOrders(
+//     bytes32 poolId,
+//     int24 tick,
+//     bool zeroForOne,
+//     int24 newTick,  // Added newTick parameter to check thresholds
+//     uint256 index,
+//     LimitOrder[] memory orders,
+//     bytes32[] memory orderIds
+// ) internal view returns (uint256) {
+//     bytes32[] storage tickOrders = tickToOrders[poolId][tick];
+//     for(uint256 j; j < tickOrders.length;) {
+//         LimitOrder storage order = limitOrders[tickOrders[j]];
+        
+//         // Only process unexecuted orders
+//         if (order.delta == BalanceDelta.wrap(0)) {
+//             bool shouldExecute;
+            
+//             if (zeroForOne) {
+//                 // For token1->token0 swaps (zeroForOne=true):
+//                 // - order must be selling token1 (isToken0=false)
+//                 // - newTick must be strictly less than bottomTick
+//                 shouldExecute = !order.isToken0 && newTick < order.bottomTick;
+//             } else {
+//                 // For token0->token1 swaps (zeroForOne=false):
+//                 // - order must be selling token0 (isToken0=true)
+//                 // - topTick must be less than or equal to newTick
+//                 shouldExecute = order.isToken0 && order.topTick <= newTick;
+//             }
+            
+//             if (shouldExecute) {
+//                 orders[index] = limitOrders[tickOrders[j]];
+//                 orderIds[index++] = tickOrders[j];
+//             }
+//         }
+//         unchecked { ++j; }
+//     }
+//     return index;
+// }
+
+struct TraversalState {
+    int24 currentTick;
+    int24 lastFoundTick;
+    uint256 iterations;
+    uint256 totalOrders;
+}
+
+function _handleOrder(
+    bytes32 poolId,
+    int24 nextTick,
+    int24 newTick,
+    bool zeroForOne
+) internal view returns (uint256 orderCount) {
+    bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
+    console.log("Found orders at tick:", nextTick);
+    console.log("Number of orders:", tickOrders.length);
+    
+    for (uint256 i = 0; i < tickOrders.length; i++) {
+        LimitOrder storage order = limitOrders[tickOrders[i]];
+        console.log("Order at tick:", nextTick);
+        console.log("Bottom tick:", order.bottomTick);
+        console.log("Top tick:", order.topTick);
+        console.log("Is Token0:", order.isToken0);
+        console.log("Is Executed:", order.delta != BalanceDelta.wrap(0));
+
+        if (order.delta == BalanceDelta.wrap(0)) {
+            if (zeroForOne) {
+                if (!order.isToken0 && newTick < order.bottomTick) {
+                    console.log("Found valid token1 order at tick", nextTick);
+                    orderCount++;
+                }
+            } else {
+                if (order.isToken0 && order.topTick <= newTick) {
+                    console.log("Found valid token0 order at tick", nextTick);
+                    orderCount++;
+                }
+            }
+        }
+    }
+}
+
+function _countValidOrders(
+    bytes32 poolId,
+    int24 oldTick,
+    int24 newTick,
+    int24 tickSpacing,
+    bool zeroForOne
+) internal view returns (uint256 totalOrders) {
+    console.log("Old Tick:", oldTick);
+    console.log("to New TIck: ", newTick);
+    console.log("Direction zeroForOne:", zeroForOne);
+
+    oldTick = oldTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
+              oldTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : oldTick;
+    newTick = newTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
+              newTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : newTick;
+    
+    TraversalState memory state;
+    state.currentTick = (oldTick / tickSpacing) * tickSpacing;
+    state.lastFoundTick = zeroForOne ? TickMath.MAX_TICK : TickMath.MIN_TICK;
+    
+    while (true) {
+        state.iterations++;
+        if (state.iterations > 100) {
+            console.log("Breaking after 100 iterations");
+            break;
+        }
+
+        (int24 nextTick, bool initialized) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
+            state.currentTick,
+            tickSpacing,
+            zeroForOne
+        );
+
+        console.log("Found tick:", nextTick);
+        console.log("initialized:", initialized);
+
+        bool shouldBreak = zeroForOne ? 
+            (nextTick <= newTick || nextTick >= state.lastFoundTick) :
+            (nextTick >= newTick || nextTick <= state.lastFoundTick);
+
+        if (shouldBreak) {
+            console.log("Breaking - nextTick:", nextTick);
+            console.log("newTick:", newTick);
+            console.log("lastFoundTick:", state.lastFoundTick);
+            break;
+        }
+
+        state.lastFoundTick = nextTick;
+
+        if (initialized) {
+            state.totalOrders += _handleOrder(poolId, nextTick, newTick, zeroForOne);
+        }
+
+        state.currentTick = nextTick + (zeroForOne ? -tickSpacing : tickSpacing);
+        console.log("Moving to tick:", state.currentTick);
+    }
+    
+    console.log("Total valid orders found:", state.totalOrders);
+    return state.totalOrders;
+}
+function _processTickOrders(
+    bytes32 poolId,
+    int24 tick,
+    bool zeroForOne,
+    int24 newTick,
+    uint256 index,
+    LimitOrder[] memory orders,
+    bytes32[] memory orderIds
+) internal view returns (uint256) {
+    console.log("\nProcessing orders at tick:", tick);
+    bytes32[] storage tickOrders = tickToOrders[poolId][tick];
+    
+    for(uint256 j; j < tickOrders.length;) {
+        LimitOrder storage order = limitOrders[tickOrders[j]];
+        console.log("Processing order at tick:", tick);
+        console.log("bottomTick:", order.bottomTick);
+        console.log("topTick:", order.topTick);
+        console.log("isToken0:", order.isToken0);
+        console.log("executed:", order.delta != BalanceDelta.wrap(0));
+        
+        if (order.delta == BalanceDelta.wrap(0)) {
+            bool shouldExecute;
+            
+            if (zeroForOne) {
+                shouldExecute = !order.isToken0 && newTick < order.bottomTick;
+                if (shouldExecute) console.log("Will execute token1 order");
+            } else {
+                shouldExecute = order.isToken0 && order.topTick <= newTick;
+                if (shouldExecute) console.log("Will execute token0 order");
+            }
+            
+            if (shouldExecute) {
                 orders[index] = limitOrders[tickOrders[j]];
                 orderIds[index++] = tickOrders[j];
+                console.log("Order queued for execution at index:", index - 1);
             }
-            unchecked { ++j; }
         }
-        return index;
+        unchecked { ++j; }
     }
-    function _collectOrders(
-        bytes32 poolId,
-        int24 oldTick,
-        int24 newTick,
-        int24 tickSpacing,
-        bool zeroForOne,
-        uint256 totalOrders
-    ) internal view returns (LimitOrder[] memory orders, bytes32[] memory orderIds) {
-        orders = new LimitOrder[](totalOrders);
-        orderIds = new bytes32[](totalOrders);
-        uint256 index;
-        int24 tick = oldTick;
-        bool hasOrders;
+    return index;
+}
+struct OrderTraversalState {
+    uint256 index;
+    int24 currentTick;
+}
 
-        while (zeroForOne ? tick > newTick : tick < newTick) {
-            (tick, hasOrders) = _getNextTickInfo(poolId, tick, tickSpacing, zeroForOne);
-            if (hasOrders) {
-                index = _processTickOrders(poolId, tick, zeroForOne, index, orders, orderIds);
-            }
+function _traverseOrders(
+    bytes32 poolId,
+    int24 tickSpacing,
+    int24 newTick,
+    bool zeroForOne,
+    OrderTraversalState memory state
+) internal view returns (
+    int24 nextTick,
+    bool initialized
+) {
+    return tickBitmap[poolId].nextInitializedTickWithinOneWord(
+        state.currentTick,
+        tickSpacing,
+        zeroForOne
+    );
+}
+
+function _shouldProcessOrder(
+    LimitOrder storage order,
+    int24 newTick,
+    bool zeroForOne
+) internal view returns (bool shouldAdd) {
+    if (order.delta == BalanceDelta.wrap(0)) {
+        if (zeroForOne) {
+            shouldAdd = !order.isToken0 && newTick < order.bottomTick;
+        } else {
+            shouldAdd = order.isToken0 && order.topTick <= newTick;
         }
     }
+}
+
+function _collectOrders(
+    bytes32 poolId,
+    int24 oldTick,
+    int24 newTick,  
+    int24 tickSpacing,
+    bool zeroForOne,
+    uint256 totalOrders
+) internal view returns (LimitOrder[] memory orders, bytes32[] memory orderIds) {
+    orders = new LimitOrder[](totalOrders);
+    orderIds = new bytes32[](totalOrders);
+    
+    OrderTraversalState memory state;
+    state.currentTick = (oldTick / tickSpacing) * tickSpacing;
+
+    while (state.index < totalOrders) {
+        (int24 nextTick, bool initialized) = _traverseOrders(
+            poolId,
+            tickSpacing,
+            newTick,
+            zeroForOne,
+            state
+        );
+
+        if (zeroForOne ? nextTick <= newTick : nextTick >= newTick) {
+            break;
+        }
+
+        if (initialized) {
+            bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
+            for (uint256 i = 0; i < tickOrders.length && state.index < totalOrders; i++) {
+                LimitOrder storage order = limitOrders[tickOrders[i]];
+                if (_shouldProcessOrder(order, newTick, zeroForOne)) {
+                    orders[state.index] = order;
+                    orderIds[state.index] = tickOrders[i];
+                    state.index++;
+                }
+            }
+        }
+
+        if (nextTick == state.currentTick) {
+            state.currentTick += zeroForOne ? -tickSpacing : tickSpacing;
+        } else {
+            state.currentTick = nextTick;
+        }
+
+        if (zeroForOne ? state.currentTick < newTick : state.currentTick > newTick) {
+            break;
+        }
+    }
+}
+// function _collectOrders(
+//     bytes32 poolId,
+//     int24 oldTick,
+//     int24 newTick,
+//     int24 tickSpacing,
+//     bool zeroForOne,
+//     uint256 totalOrders
+// ) internal view returns (LimitOrder[] memory orders, bytes32[] memory orderIds) {
+//     orders = new LimitOrder[](totalOrders);
+//     orderIds = new bytes32[](totalOrders);
+//     uint256 index;
+//     int24 tick = oldTick;
+//     bool hasOrders;
+
+//     while (zeroForOne ? tick > newTick : tick < newTick) {
+//         (tick, hasOrders) = _getNextTickInfo(poolId, tick, tickSpacing, zeroForOne);
+//         if (hasOrders) {
+//             index = _processTickOrders(poolId, tick, zeroForOne, newTick, index, orders, orderIds);
+//         }
+//     }
+// }
 
 // Update _processOrder to store only delta
 function _processOrder(
