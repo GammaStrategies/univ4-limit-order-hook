@@ -221,49 +221,6 @@ function _createOrder(
     return orderId;
 }
 
-function _addOrderToTick(
-    bytes32 poolId,
-    bytes32 orderId,
-    int24 tick,
-    IPoolManager manager
-) internal {
-    // Check if any orders exist at this tick
-    bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
-    bool hasExistingOrders = ordersAtTick.length > 0;
-
-    // Add the order
-    ordersAtTick.push(orderId);
-
-    // Only flip if this is the first order at this tick
-    if (!hasExistingOrders) {
-        PoolId id = PoolId.wrap(poolId);
-        manager.updateTick(id, tick);
-    }
-}
-
-function _removeOrderFromTick(
-    bytes32 poolId,
-    int24 tick,
-    IPoolManager manager
-) internal {
-    bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
-    
-    // Check remaining unexecuted orders
-    bool hasUnexecutedOrders = false;
-    for (uint256 i = 0; i < ordersAtTick.length; i++) {
-        if (limitOrders[ordersAtTick[i]].delta == BalanceDelta.wrap(0)) {
-            hasUnexecutedOrders = true;
-            break;
-        }
-    }
-
-    // Only flip the bit back if no unexecuted orders remain
-    if (!hasUnexecutedOrders) {
-        PoolId id = PoolId.wrap(poolId);
-        manager.updateTick(id, tick);
-    }
-}
-
     function _calculateTicks(
         bool isToken0,
         bool isRange,
@@ -509,20 +466,7 @@ function _addLiquidity(
             return abi.encode(0);
         }
     }
-    function _cleanupOrderAtTick(bytes32 poolId, int24 tick, bytes32 orderId, int24 tickSpacing) internal {
-        bytes32[] storage ordersAtTick = tickToOrders[poolId][tick];
-        for (uint256 i = 0; i < ordersAtTick.length; i++) {
-            if (ordersAtTick[i] == orderId) {
-                ordersAtTick[i] = ordersAtTick[ordersAtTick.length - 1];
-                ordersAtTick.pop();
-                break;
-            }
-        }
-        
-        if (ordersAtTick.length == 0) {
-            _removeTickFromPool(poolId, tick, tickSpacing);
-        }
-    }
+
 // Add at contract level
 uint256 private orderNonce;
 
@@ -547,8 +491,15 @@ function _storeOrder(
     });
 
     int24 storeTick = params.isToken0 ? params.topTick : params.bottomTick;
-    _addTickToPool(poolId, storeTick, key.tickSpacing);
-    tickToOrders[poolId][storeTick].push(orderId);
+
+    // Only flip the bit if this is the first order at this tick
+    bytes32[] storage ordersAtTick = tickToOrders[poolId][storeTick];
+    if (ordersAtTick.length == 0) {
+        _addTickToPool(poolId, storeTick, key.tickSpacing);
+    }
+
+
+    ordersAtTick.push(orderId);
 
     return orderId;
 }
@@ -648,164 +599,7 @@ function _executeOrders(
     }
 }
 
-// function _countValidOrders(
-//     bytes32 poolId,
-//     int24 oldTick,
-//     int24 newTick,
-//     int24 tickSpacing,
-//     bool zeroForOne
-// ) internal view returns (uint256 totalOrders) {
-//     int24 countTick = oldTick;
-    
-//     while (zeroForOne ? countTick > newTick : countTick < newTick) {
-//         (int24 nextTick, bool hasOrders) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
-//             countTick,
-//             tickSpacing,
-//             zeroForOne
-//         );
-        
-//         if (hasOrders) {
-//             bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
-//             for(uint256 j = 0; j < tickOrders.length; j++) {
-//                 LimitOrder storage order = limitOrders[tickOrders[j]];
-//                 // Check if order is unexecuted (delta == 0)
-//                 if (order.delta == BalanceDelta.wrap(0)) {
-//                     if (zeroForOne) {
-//                         // zeroForOne = true means token0->token1 swaps (price going down)
-//                         // and newTick must be strictly less than bottomTick to execute the token1 orders
-//                         if (!order.isToken0 && newTick < order.bottomTick) {
-//                             totalOrders++;
-//                         }
-//                     } else {
-//                         // zeroForOne = false means token1->token0 swaps (price going up)
-//                         // and topTick must be less than or equal to newTick to execute the token0 orders
-//                         if (order.isToken0 && order.topTick <= newTick) {
-//                             totalOrders++;
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//         countTick = nextTick;
-//     }
-//     return totalOrders;
-// }
 
-    function _getNextTickInfo(
-        bytes32 poolId,
-        int24 tick,
-        int24 tickSpacing,
-        bool zeroForOne
-    ) internal view returns (int24 nextTick, bool hasOrders) {
-        return tickBitmap[poolId].nextInitializedTickWithinOneWord(
-            tick,
-            tickSpacing,
-            zeroForOne
-        );
-    }
-
-
-
-// function _countValidOrders(
-//     bytes32 poolId,
-//     int24 oldTick,
-//     int24 newTick,
-//     int24 tickSpacing,
-//     bool zeroForOne
-// ) internal view returns (uint256 totalOrders) {
-//     // Ensure we're within valid tick range
-//     oldTick = oldTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
-//               oldTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : oldTick;
-//     newTick = newTick < TickMath.MIN_TICK ? TickMath.MIN_TICK : 
-//               newTick > TickMath.MAX_TICK ? TickMath.MAX_TICK : newTick;
-    
-//     // Align start tick with spacing
-//     oldTick = (oldTick / tickSpacing) * tickSpacing;
-    
-//     int24 currentTick = oldTick;
-    
-//     // Track the last found tick to avoid infinite loops
-//     int24 lastFoundTick = zeroForOne ? TickMath.MAX_TICK : TickMath.MIN_TICK;
-    
-//     while (true) {
-//         (int24 nextTick, bool initialized) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
-//             currentTick,
-//             tickSpacing,
-//             zeroForOne
-//         );
-
-//         // Break if we've reached or crossed the target tick
-//         if (zeroForOne) {
-//             if (nextTick <= newTick || nextTick >= lastFoundTick) break;
-//             lastFoundTick = nextTick;
-//         } else {
-//             if (nextTick >= newTick || nextTick <= lastFoundTick) break;
-//             lastFoundTick = nextTick;
-//         }
-
-//         if (initialized) {
-//             bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
-//             for (uint256 i = 0; i < tickOrders.length; i++) {
-//                 LimitOrder storage order = limitOrders[tickOrders[i]];
-//                 if (order.delta == BalanceDelta.wrap(0)) {
-//                     if (zeroForOne) {
-//                         if (!order.isToken0 && newTick < order.bottomTick) {
-//                             totalOrders++;
-//                         }
-//                     } else {
-//                         if (order.isToken0 && order.topTick <= newTick) {
-//                             totalOrders++;
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-
-//         // Move to next tick
-//         currentTick = nextTick + (zeroForOne ? -tickSpacing : tickSpacing);
-//     }
-    
-//     return totalOrders;
-// }
-
-// function _processTickOrders(
-//     bytes32 poolId,
-//     int24 tick,
-//     bool zeroForOne,
-//     int24 newTick,  // Added newTick parameter to check thresholds
-//     uint256 index,
-//     LimitOrder[] memory orders,
-//     bytes32[] memory orderIds
-// ) internal view returns (uint256) {
-//     bytes32[] storage tickOrders = tickToOrders[poolId][tick];
-//     for(uint256 j; j < tickOrders.length;) {
-//         LimitOrder storage order = limitOrders[tickOrders[j]];
-        
-//         // Only process unexecuted orders
-//         if (order.delta == BalanceDelta.wrap(0)) {
-//             bool shouldExecute;
-            
-//             if (zeroForOne) {
-//                 // For token1->token0 swaps (zeroForOne=true):
-//                 // - order must be selling token1 (isToken0=false)
-//                 // - newTick must be strictly less than bottomTick
-//                 shouldExecute = !order.isToken0 && newTick < order.bottomTick;
-//             } else {
-//                 // For token0->token1 swaps (zeroForOne=false):
-//                 // - order must be selling token0 (isToken0=true)
-//                 // - topTick must be less than or equal to newTick
-//                 shouldExecute = order.isToken0 && order.topTick <= newTick;
-//             }
-            
-//             if (shouldExecute) {
-//                 orders[index] = limitOrders[tickOrders[j]];
-//                 orderIds[index++] = tickOrders[j];
-//             }
-//         }
-//         unchecked { ++j; }
-//     }
-//     return index;
-// }
 
 struct TraversalState {
     int24 currentTick;
@@ -821,26 +615,26 @@ function _handleOrder(
     bool zeroForOne
 ) internal view returns (uint256 orderCount) {
     bytes32[] storage tickOrders = tickToOrders[poolId][nextTick];
-    console.log("Found orders at tick:", nextTick);
-    console.log("Number of orders:", tickOrders.length);
+    // console.log("Found orders at tick:", nextTick);
+    // console.log("Number of orders:", tickOrders.length);
     
     for (uint256 i = 0; i < tickOrders.length; i++) {
         LimitOrder storage order = limitOrders[tickOrders[i]];
-        console.log("Order at tick:", nextTick);
-        console.log("Bottom tick:", order.bottomTick);
-        console.log("Top tick:", order.topTick);
-        console.log("Is Token0:", order.isToken0);
-        console.log("Is Executed:", order.delta != BalanceDelta.wrap(0));
+        // console.log("Order at tick:", nextTick);
+        // console.log("Bottom tick:", order.bottomTick);
+        // console.log("Top tick:", order.topTick);
+        // console.log("Is Token0:", order.isToken0);
+        // console.log("Is Executed:", order.delta != BalanceDelta.wrap(0));
 
         if (order.delta == BalanceDelta.wrap(0)) {
             if (zeroForOne) {
                 if (!order.isToken0 && newTick < order.bottomTick) {
-                    console.log("Found valid token1 order at tick", nextTick);
+                    // console.log("Found valid token1 order at tick", nextTick);
                     orderCount++;
                 }
             } else {
                 if (order.isToken0 && order.topTick <= newTick) {
-                    console.log("Found valid token0 order at tick", nextTick);
+                    // console.log("Found valid token0 order at tick", nextTick);
                     orderCount++;
                 }
             }
@@ -897,32 +691,32 @@ function _processTickOrders(
     LimitOrder[] memory orders,
     bytes32[] memory orderIds
 ) internal view returns (uint256) {
-    console.log("\nProcessing orders at tick:", tick);
+    // console.log("\nProcessing orders at tick:", tick);
     bytes32[] storage tickOrders = tickToOrders[poolId][tick];
     
     for(uint256 j; j < tickOrders.length;) {
         LimitOrder storage order = limitOrders[tickOrders[j]];
-        console.log("Processing order at tick:", tick);
-        console.log("bottomTick:", order.bottomTick);
-        console.log("topTick:", order.topTick);
-        console.log("isToken0:", order.isToken0);
-        console.log("executed:", order.delta != BalanceDelta.wrap(0));
+        // console.log("Processing order at tick:", tick);
+        // console.log("bottomTick:", order.bottomTick);
+        // console.log("topTick:", order.topTick);
+        // console.log("isToken0:", order.isToken0);
+        // console.log("executed:", order.delta != BalanceDelta.wrap(0));
         
         if (order.delta == BalanceDelta.wrap(0)) {
             bool shouldExecute;
             
             if (zeroForOne) {
                 shouldExecute = !order.isToken0 && newTick < order.bottomTick;
-                if (shouldExecute) console.log("Will execute token1 order");
+                // if (shouldExecute) console.log("Will execute token1 order");
             } else {
                 shouldExecute = order.isToken0 && order.topTick <= newTick;
-                if (shouldExecute) console.log("Will execute token0 order");
+                // if (shouldExecute) console.log("Will execute token0 order");
             }
             
             if (shouldExecute) {
                 orders[index] = limitOrders[tickOrders[j]];
                 orderIds[index++] = tickOrders[j];
-                console.log("Order queued for execution at index:", index - 1);
+                // console.log("Order queued for execution at index:", index - 1);
             }
         }
         unchecked { ++j; }
@@ -1016,29 +810,8 @@ function _collectOrders(
         }
     }
 }
-// function _collectOrders(
-//     bytes32 poolId,
-//     int24 oldTick,
-//     int24 newTick,
-//     int24 tickSpacing,
-//     bool zeroForOne,
-//     uint256 totalOrders
-// ) internal view returns (LimitOrder[] memory orders, bytes32[] memory orderIds) {
-//     orders = new LimitOrder[](totalOrders);
-//     orderIds = new bytes32[](totalOrders);
-//     uint256 index;
-//     int24 tick = oldTick;
-//     bool hasOrders;
 
-//     while (zeroForOne ? tick > newTick : tick < newTick) {
-//         (tick, hasOrders) = _getNextTickInfo(poolId, tick, tickSpacing, zeroForOne);
-//         if (hasOrders) {
-//             index = _processTickOrders(poolId, tick, zeroForOne, newTick, index, orders, orderIds);
-//         }
-//     }
-// }
 
-// Update _processOrder to store only delta
 function _processOrder(
     PoolKey memory key,
     LimitOrder storage order,
@@ -1052,16 +825,16 @@ function _processOrder(
     uint256 amount0;
     uint256 amount1;
 
-    console.log("delta0:",delta.amount0());
-    console.log("delta1:",delta.amount1());
+    // console.log("delta0:",delta.amount0());
+    // console.log("delta1:",delta.amount1());
     {
         int128 delta0 = delta.amount0();
         int128 delta1 = delta.amount1();
         if (delta0 > 0) amount0 = uint256(int256(delta0));
         if (delta1 > 0) amount1 = uint256(int256(delta1));
     }
-    console.log("amount0:",amount0);
-    console.log("amount1:",amount1);
+    // console.log("amount0:",amount0);
+    // console.log("amount1:",amount1);
     // Mint tokens to hook for settlement
     if (amount0 > 0) {
         uint256 currency0Id = uint256(uint160(Currency.unwrap(key.currency0)));
@@ -1142,7 +915,17 @@ function _burnLimitOrder(
         }
     }
     
-    if (ordersAtTick.length == 0) {
+    // Check if there are any unexecuted orders remaining
+    bool hasUnexecutedOrders = false;
+    for (uint256 i = 0; i < ordersAtTick.length; i++) {
+        if (limitOrders[ordersAtTick[i]].delta == BalanceDelta.wrap(0)) {
+            hasUnexecutedOrders = true;
+            break;
+        }
+    }
+
+    // Only flip the bit back if no unexecuted orders remain
+    if (!hasUnexecutedOrders) {
         _removeTickFromPool(poolId, tickToClean, key.tickSpacing);
     }
 

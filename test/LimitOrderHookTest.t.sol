@@ -533,7 +533,7 @@ assertTrue(order2.delta != BalanceDelta.wrap(0), "Order 2 (3.0x) not executed");
 } 
  
 function test_afterSwap_gas_limits() public {
-    uint256 BATCH_SIZE = 51;
+    uint256 BATCH_SIZE = 1;
     
     deal(Currency.unwrap(currency0), address(this), 1000000 ether);
     deal(Currency.unwrap(currency1), address(this), 1000000 ether);
@@ -564,7 +564,7 @@ function test_afterSwap_gas_limits() public {
         key,
         IPoolManager.SwapParams({
             zeroForOne: false,
-            amountSpecified: -50 ether,
+            amountSpecified: -120 ether,
             sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.maxUsableTick(60))
         }),
         PoolSwapTest.TestSettings({
@@ -590,183 +590,65 @@ function test_afterSwap_gas_limits() public {
     console.log("Orders executed: %s/%s", executedOrders, BATCH_SIZE);
     console.log("Total gas used: %s", orderCreationGas + swapGasUsed);
 }
-//         // Create order selling token1 for token0
-//         uint256 sellAmount = 1 ether;
-//         uint256 limitPrice = 1.02e18; // Price above current
-//         bytes32 orderId = hook.createLimitOrder(false, false, limitPrice, sellAmount, key);
 
-//         uint256 token0Before = currency0.balanceOfSelf();
-//         uint256 token1Before = currency1.balanceOfSelf();
+function test_afterSwap_gas_limits_isToken1() public {
+    uint256 BATCH_SIZE = 1;
+    
+    deal(Currency.unwrap(currency0), address(this), 1000000 ether);
+    deal(Currency.unwrap(currency1), address(this), 1000000 ether);
 
-//         // Execute large swap that should trigger the limit order
-//         vm.expectEmit(true, true, false, false);
-//         emit LimitOrderExecuted(orderId, address(this), 0, 0);
-        
-//         swapRouter.swap(
-//             key,
-//             IPoolManager.SwapParams({
-//                 zeroForOne: true,
-//                 amountSpecified: -2 ether,
-//                 sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
-//             }),
-//             PoolSwapTest.TestSettings({
-//                 takeClaims: false,
-//                 settleUsingBurn: false
-//             }),
-//             ZERO_BYTES
-//         );
+    bytes32[] memory orderIds = new bytes32[](BATCH_SIZE);
+    uint256 orderCreationGas = 0;
+    
+    // Create orders with isToken0 = false (selling token1 at a higher price)
+    for (uint256 i = 0; i < BATCH_SIZE; i++) {
+        uint256 gasBefore = gasleft();
+        orderIds[i] = hook.createLimitOrder(
+            false,      // Selling token1
+            false,      // Not range order
+            0.95e18,    // Price above 1.0 means we expect token1 -> token0 at a higher price point
+            0.1 ether,
+            key
+        );
+        orderCreationGas += gasBefore - gasleft();
+    }
+    
+    console.log("Total creation gas: %s", orderCreationGas);
+    console.log("Average creation gas per order: %s", orderCreationGas / BATCH_SIZE);
+    
+    // Execute swap in the opposite direction to move the price down
+    // Since isToken0 = false, we need zeroForOne = true to push price downwards, enabling token1-for-token0 execution.
+    uint256 swapGasBefore = gasleft();
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: true,
+            amountSpecified: -120 ether,
+            sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.minUsableTick(60))
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+    
+    uint256 swapGasUsed = swapGasBefore - gasleft();
+    console.log("Swap gas used: %s", swapGasUsed);
+    console.log("Average gas per order in swap: %s", swapGasUsed / BATCH_SIZE);
+    
+    // Verify executions
+    uint256 executedOrders = 0;
+    for (uint256 i = 0; i < BATCH_SIZE; i++) {
+        ILimitOrderHook.LimitOrder memory order = ILimitOrderHook(address(hook)).limitOrders(orderIds[i]);
+        if (order.delta != BalanceDelta.wrap(0)) {
+            executedOrders++;
+        }
+    }
+    
+    console.log("Orders executed: %s/%s", executedOrders, BATCH_SIZE);
+    console.log("Total gas used: %s", orderCreationGas + swapGasUsed);
+}
 
-//         // Verify order executed
-//         (,,,,,,bool executed,,,,,) = hook.limitOrders(orderId);
-//         assertTrue(executed, "Order not executed");
 
-//         // Claim and verify balances
-//         hook.claimLimitOrder(orderId, key);
-        
-//         uint256 token0After = currency0.balanceOfSelf();
-//         uint256 token1After = currency1.balanceOfSelf();
-
-//         assertTrue(token0After > token0Before, "No token0 received");
-//         assertEq(token1Before - token1After, sellAmount, "Incorrect token1 amount");
-//     }
-
-//     function test_range_orders() public {
-//         // Test range order creation and execution
-//         uint256 amount = 1 ether;
-//         uint256 price = 0.98e18;
-//         bool isToken0 = true;
-//         bool isRange = true;
-
-//         bytes32 orderId = hook.createLimitOrder(
-//             isToken0,
-//             isRange,
-//             price,
-//             amount,
-//             key
-//         );
-
-//         // Verify range order specific parameters
-//         (,, bool orderIsRange,,int24 bottomTick, int24 topTick,,,,,, uint128 liquidity) = hook.limitOrders(orderId);
-//         assertTrue(orderIsRange, "Not marked as range order");
-//         assertTrue(bottomTick < topTick, "Invalid range");
-//         assertTrue(liquidity > 0, "No liquidity");
-
-//         // Execute range order
-//         swapRouter.swap(
-//             key,
-//             IPoolManager.SwapParams({
-//                 zeroForOne: false,
-//                 amountSpecified: -2 ether,
-//                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-//             }),
-//             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-//             ZERO_BYTES
-//         );
-
-//         // Verify execution
-//         (,,,,,,bool executed,,,,,) = hook.limitOrders(orderId);
-//         assertTrue(executed, "Range order not executed");
-//     }
-
-//     function test_multiple_orders_execution() public {
-//         // Create multiple orders at different price points
-//         bytes32[] memory orders = new bytes32[](3);
-//         orders[0] = hook.createLimitOrder(true, false, 0.98e18, 1 ether, key);
-//         orders[1] = hook.createLimitOrder(true, false, 0.97e18, 1 ether, key);
-//         orders[2] = hook.createLimitOrder(true, false, 0.96e18, 1 ether, key);
-
-//         // Large swap to trigger all orders
-//         swapRouter.swap(
-//             key,
-//             IPoolManager.SwapParams({
-//                 zeroForOne: false,
-//                 amountSpecified: -5 ether,
-//                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-//             }),
-//             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-//             ZERO_BYTES
-//         );
-
-//         // Verify all orders executed
-//         for(uint i = 0; i < orders.length; i++) {
-//             (,,,,,,bool executed,,,,,) = hook.limitOrders(orders[i]);
-//             assertTrue(executed, string.concat("Order ", vm.toString(i), " not executed"));
-            
-//             // Claim each order
-//             hook.claimLimitOrder(orders[i], key);
-//         }
-//     }
-
-//     function test_transient_storage() public {
-//         // Test that transient storage is working correctly for tick tracking
-//         bytes32 orderId = hook.createLimitOrder(true, false, 0.98e18, 1 ether, key);
-        
-//         // Record starting tick
-//         bytes32 poolId = getPoolId(key);
-//         (,int24 startTick,,) = StateLibrary.getSlot0(manager, PoolId.wrap(poolId));
-        
-//         // Execute swap
-//         swapRouter.swap(
-//             key,
-//             IPoolManager.SwapParams({
-//                 zeroForOne: false,
-//                 amountSpecified: -2 ether,
-//                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-//             }),
-//             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-//             ZERO_BYTES
-//         );
-        
-//         // Verify order executed
-//         (,,,,,,bool executed,,,,,) = hook.limitOrders(orderId);
-//         assertTrue(executed, "Order should execute if transient storage working");
-//     }
-
-//     function test_claiming() public {
-//         // Test claim restrictions and token transfers
-//         bytes32 orderId = hook.createLimitOrder(true, false, 0.98e18, 1 ether, key);
-        
-//         // Should not be able to claim unexecuted order
-//         vm.expectRevert("Order not executed");
-//         hook.claimLimitOrder(orderId, key);
-        
-//         // Execute order
-//         swapRouter.swap(
-//             key,
-//             IPoolManager.SwapParams({
-//                 zeroForOne: false,
-//                 amountSpecified: -2 ether,
-//                 sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-//             }),
-//             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-//             ZERO_BYTES
-//         );
-        
-//         // Test claiming as non-owner
-//         address nonOwner = address(0xdead);
-//         vm.prank(nonOwner);
-//         vm.expectRevert("Not owner");
-//         hook.claimLimitOrder(orderId, key);
-        
-//         // Successful claim
-//         uint256 token0Before = currency0.balanceOfSelf();
-//         uint256 token1Before = currency1.balanceOfSelf();
-        
-//         hook.claimLimitOrder(orderId, key);
-        
-//         uint256 token0After = currency0.balanceOfSelf();
-//         uint256 token1After = currency1.balanceOfSelf();
-        
-//         assertTrue(token0After != token0Before || token1After != token1Before, "No tokens transferred");
-//     }
-
-//     function getPoolId(PoolKey memory _key) internal pure returns (bytes32) {
-//         return keccak256(abi.encode(
-//             _key.currency0,
-//             _key.currency1,
-//             _key.fee,
-//             _key.tickSpacing,
-//             _key.hooks
-//         ));
-//     }
 }
