@@ -533,7 +533,7 @@ assertTrue(order2.delta != BalanceDelta.wrap(0), "Order 2 (3.0x) not executed");
 } 
  
 function test_afterSwap_gas_limits() public {
-    uint256 BATCH_SIZE = 1;
+    uint256 BATCH_SIZE = 10;
     
     deal(Currency.unwrap(currency0), address(this), 1000000 ether);
     deal(Currency.unwrap(currency1), address(this), 1000000 ether);
@@ -547,7 +547,7 @@ function test_afterSwap_gas_limits() public {
         orderIds[i] = hook.createLimitOrder(
             true,
             false,
-            1.02e18,  // Fixed price point above 1.0
+            30e18,  // Fixed price point above 1.0
             0.1 ether,
             key
         );
@@ -591,8 +591,8 @@ function test_afterSwap_gas_limits() public {
     console.log("Total gas used: %s", orderCreationGas + swapGasUsed);
 }
 
-function test_afterSwap_gas_limits_isToken1() public {
-    uint256 BATCH_SIZE = 1;
+function test_afterSwap_isToken1_gasLimits() public {
+    uint256 BATCH_SIZE = 10;
     
     deal(Currency.unwrap(currency0), address(this), 1000000 ether);
     deal(Currency.unwrap(currency1), address(this), 1000000 ether);
@@ -606,7 +606,7 @@ function test_afterSwap_gas_limits_isToken1() public {
         orderIds[i] = hook.createLimitOrder(
             false,      // Selling token1
             false,      // Not range order
-            0.95e18,    // Price above 1.0 means we expect token1 -> token0 at a higher price point
+            0.001e18,    // Price above 1.0 means we expect token1 -> token0 at a higher price point
             0.1 ether,
             key
         );
@@ -623,7 +623,7 @@ function test_afterSwap_gas_limits_isToken1() public {
         key,
         IPoolManager.SwapParams({
             zeroForOne: true,
-            amountSpecified: -120 ether,
+            amountSpecified: -1000 ether,
             sqrtPriceLimitX96: TickMath.getSqrtPriceAtTick(TickMath.minUsableTick(60))
         }),
         PoolSwapTest.TestSettings({
@@ -649,6 +649,5 @@ function test_afterSwap_gas_limits_isToken1() public {
     console.log("Orders executed: %s/%s", executedOrders, BATCH_SIZE);
     console.log("Total gas used: %s", orderCreationGas + swapGasUsed);
 }
-
 
 }
