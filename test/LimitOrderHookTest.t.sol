@@ -17,6 +17,7 @@ import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
+import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 
 interface ILimitOrderHook {
     struct LimitOrder {
@@ -648,6 +649,131 @@ function test_afterSwap_isToken1_gasLimits() public {
     
     console.log("Orders executed: %s/%s", executedOrders, BATCH_SIZE);
     console.log("Total gas used: %s", orderCreationGas + swapGasUsed);
+}
+
+
+// Main test function
+function test_claim_limit_order_with_logs() public {
+    bytes32 orderId = setupBalancesAndCreateOrder();
+    executeSwap();
+    checkOrderAndClaim(orderId);
+}
+
+function setupBalancesAndCreateOrder() internal returns (bytes32) {
+    // Set up initial balances
+    deal(Currency.unwrap(currency0), address(this), 100 ether);
+    deal(Currency.unwrap(currency1), address(this), 100 ether);
+    
+    // Create order selling token0 for token1 at higher price
+    uint256 sellAmount = 1 ether;
+    uint256 limitPrice = 1.02e18; // Price ABOVE current (1.0) for token0 orders
+    
+    console.log("=== Creating Limit Order ===");
+    console.log("Selling: ", true ? "token0" : "token1");
+    console.log("Amount selling (tokens): ", sellAmount);
+    console.log("Limit price (token1/token0): ", limitPrice);
+    
+    bytes32 orderId = hook.createLimitOrder(true, false, limitPrice, sellAmount, key);
+    
+    // DEBUG: Check the order owner immediately after creation
+    ILimitOrderHook.LimitOrder memory orderAfterCreation = ILimitOrderHook(address(hook)).limitOrders(orderId);
+    console.log("\n=== Order Creation Status ===");
+    console.log("Order owner: ", orderAfterCreation.owner);
+    console.log("Test contract address: ", address(this));
+    
+    // Log pre-swap balances
+    uint256 preSwapBalance0 = IERC20Minimal(Currency.unwrap(currency0)).balanceOf(address(this));
+    uint256 preSwapBalance1 = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
+    // console.log("\n=== Pre-Swap Balances ===");
+    // console.log("Token0 balance: ", preSwapBalance0 );
+    // console.log("Token1 balance: ", preSwapBalance1 );
+
+    return orderId;
+}
+
+function executeSwap() internal {
+    console.log("\n=== Executing Swap ===");
+    console.log("Swap direction: ", false ? "token0 -> token1" : "token1 -> token0");
+    console.log("Swap amount (tokens): ", "2 ether");
+    
+    uint160 maxSqrtPriceX96 = TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK/key.tickSpacing * key.tickSpacing);
+    swapRouter.swap(
+        key,
+        IPoolManager.SwapParams({
+            zeroForOne: false,
+            amountSpecified: -2 ether,
+            sqrtPriceLimitX96: maxSqrtPriceX96
+        }),
+        PoolSwapTest.TestSettings({
+            takeClaims: false,
+            settleUsingBurn: false
+        }),
+        ""
+    );
+}
+
+function checkOrderAndClaim(bytes32 orderId) internal {
+    // DEBUG: Check the order owner before claiming
+    ILimitOrderHook.LimitOrder memory orderBeforeClaim = ILimitOrderHook(address(hook)).limitOrders(orderId);
+    console.log("\n=== Pre-Claim Status ===");
+    console.log("Order owner before claim: ", orderBeforeClaim.owner);
+    console.log("Order executed status: ", orderBeforeClaim.delta != BalanceDelta.wrap(0));
+    
+    logOrderDetails(orderBeforeClaim);
+    
+    // Try to claim
+    uint256 preClaimBalance0 = IERC20Minimal(Currency.unwrap(currency0)).balanceOf(address(this));
+    uint256 preClaimBalance1 = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
+    
+    hook.claimOrder(orderId, key);
+    
+    logFinalSettlement(preClaimBalance0, preClaimBalance1);
+}
+
+function logOrderDetails(ILimitOrderHook.LimitOrder memory order) internal view {
+    int256 token0Delta = int256(order.delta.amount0());
+    int256 token1Delta = int256(order.delta.amount1());
+    
+    console.log("\n=== Order Execution Details ===");
+    console.log("Token0 delta: ", token0Delta);
+    console.log("Token1 delta: ", token1Delta);
+    
+    // Calculate expected principal
+    uint256 principalAmount = LiquidityAmounts.getAmount1ForLiquidity(
+        TickMath.getSqrtPriceAtTick(order.bottomTick),
+        TickMath.getSqrtPriceAtTick(order.topTick),
+        order.liquidity
+    );
+    
+    // Calculate fees (excess above principal)
+    uint256 fees1 = uint256(token1Delta) - principalAmount;
+    
+    logSettlementDetails(principalAmount, 0, fees1);
+}
+
+
+function logSettlementDetails(uint256 principalAmount, uint256 fees0, uint256 fees1) internal view {
+    console.log("\n=== Expected Settlement ===");
+    console.log("Principal (token1): ", principalAmount);
+    console.log("Total fees token1: ", fees1);
+    
+    uint256 treasuryFee1 = (fees1 * 20) / 100;
+    uint256 ownerFee1 = fees1 - treasuryFee1;
+    
+    console.log("\n=== Fee Distribution ===");
+    console.log("Treasury fees token1: ", treasuryFee1); 
+    console.log("Owner receives: ", principalAmount + ownerFee1);
+    console.log("  - Principal: ", principalAmount);
+    console.log("  - Owner fees: ", ownerFee1);
+}
+
+function logFinalSettlement(uint256 preClaimBalance0, uint256 preClaimBalance1) internal view {
+    uint256 postClaimBalance0 = IERC20Minimal(Currency.unwrap(currency0)).balanceOf(address(this));
+    uint256 postClaimBalance1 = IERC20Minimal(Currency.unwrap(currency1)).balanceOf(address(this));
+    
+    console.log("\n=== Final Settlement ===");
+    console.log("Token0 received: ", (postClaimBalance0 - preClaimBalance0));
+    console.log("Token1 received: ", (postClaimBalance1 - preClaimBalance1) );
 }
 
 }

@@ -477,24 +477,24 @@ contract LimitOrderHook is BaseHook {
         int24 compressed = tick / tickSpacing;
         int16 wordPos = int16(compressed >> 8);
         uint8 bitPos = uint8(uint24(compressed) & 0xff);
-        console.log("Setting tick in word:", int256(wordPos));
-        console.log("At bit position:", uint256(bitPos));
-        console.log("Bitmap word before:", uint256(tickBitmap[poolId][wordPos]));
+        // console.log("Setting tick in word:", int256(wordPos));
+        // console.log("At bit position:", uint256(bitPos));
+        // console.log("Bitmap word before:", uint256(tickBitmap[poolId][wordPos]));
 
         tickBitmap[poolId].flipTick(tick, tickSpacing);
-        console.log("Bitmap word after:", uint256(tickBitmap[poolId][wordPos]));
-        console.log("Added tick to bitmap:");
-        console.logInt(tick);
+        // console.log("Bitmap word after:", uint256(tickBitmap[poolId][wordPos]));
+        // console.log("Added tick to bitmap:");
+        // console.logInt(tick);
         // Verify the bit was set
         (int24 nextTick, bool initialized) = tickBitmap[poolId].nextInitializedTickWithinOneWord(
             tick,
             tickSpacing,
             true
         );
-        console.log("Verification - found tick:");
-        console.logInt(nextTick);
-        console.log("Verification - initialized:");
-        console.log(initialized);
+        // console.log("Verification - found tick:");
+        // console.logInt(nextTick);
+        // console.log("Verification - initialized:");
+        // console.log(initialized);
     }
 
     function _removeTickFromPool(bytes32 poolId, int24 tick, int24 tickSpacing) internal {
@@ -540,11 +540,11 @@ contract LimitOrderHook is BaseHook {
         count.wordShift = tickSpacing;
         count.tick = oldTick;
 
-        console.log("=== _countValidOrders START ===");
-        console.log("oldTick:", oldTick);
-        console.log("newTick:", newTick);
-        console.log("tickSpacing:", tickSpacing);
-        console.log("zeroForOne:", zeroForOne);
+        // console.log("=== _countValidOrders START ===");
+        // console.log("oldTick:", oldTick);
+        // console.log("newTick:", newTick);
+        // console.log("tickSpacing:", tickSpacing);
+        // console.log("zeroForOne:", zeroForOne);
 
         while (true) {
             if (zeroForOne ? (count.tick < newTick) : (count.tick > newTick)) {
@@ -557,9 +557,9 @@ contract LimitOrderHook is BaseHook {
                 zeroForOne
             );
 
-            console.log("Checking from tick:", count.tick);
-            console.log("Found nextTick:", count.nextTick);
-            console.log("initialized:", count.initialized);
+            // console.log("Checking from tick:", count.tick);
+            // console.log("Found nextTick:", count.nextTick);
+            // console.log("initialized:", count.initialized);
 
             if (count.initialized) {
                 bool inRange = zeroForOne ? (count.nextTick >= newTick) : (count.nextTick <= newTick);
@@ -585,8 +585,8 @@ contract LimitOrderHook is BaseHook {
             }
         }
 
-        console.log("totalOrders:", count.totalOrders);
-        console.log("=== _countValidOrders END ===");
+        // console.log("totalOrders:", count.totalOrders);
+        // console.log("=== _countValidOrders END ===");
         return count.totalOrders;
     }
 
@@ -653,13 +653,13 @@ contract LimitOrderHook is BaseHook {
         uint256 index,
         uint256 totalOrders
     ) internal view returns (uint256) {
-        console.log("=== _processTick ===");
-        console.log("Processing tick:");
-        console.logInt(nextTick);
-        console.log("newTick:");
-        console.logInt(newTick);
-        console.log("zeroForOne:");
-        console.log(zeroForOne);
+        // console.log("=== _processTick ===");
+        // console.log("Processing tick:");
+        // console.logInt(nextTick);
+        // console.log("newTick:");
+        // console.logInt(newTick);
+        // console.log("zeroForOne:");
+        // console.log(zeroForOne);
         bytes32[] storage tickOrdersArr = tickToOrders[poolId][nextTick];
 
         console.log("tickOrdersArr length:");
@@ -667,51 +667,51 @@ contract LimitOrderHook is BaseHook {
         for (uint256 j = 0; j < tickOrdersArr.length && index < totalOrders; j++) {
             LimitOrder storage order = limitOrders[tickOrdersArr[j]];
             bool sp = _shouldProcessOrder(order, newTick, zeroForOne);
-            console.log("Check order at _processTick");
-            console.log("isToken0:");
-            console.log(order.isToken0);
-            console.log("bottomTick:");
-            console.logInt(order.bottomTick);
-            console.log("topTick:");
-            console.logInt(order.topTick);
-            console.log("shouldProcess:");
-            console.log(sp);
+            // console.log("Check order at _processTick");
+            // console.log("isToken0:");
+            // console.log(order.isToken0);
+            // console.log("bottomTick:");
+            // console.logInt(order.bottomTick);
+            // console.log("topTick:");
+            // console.logInt(order.topTick);
+            // console.log("shouldProcess:");
+            // console.log(sp);
 
             if (sp) {
                 orders[index] = order;
                 orderIds[index] = tickOrdersArr[j];
                 index++;
-                console.log("Added order to execution list. New index:");
-                console.log(index);
+                // console.log("Added order to execution list. New index:");
+                // console.log(index);
             }
         }
-        console.log("=== _processTick END ===");
+        // console.log("=== _processTick END ===");
         return index;
     }
 
     function _shouldProcessOrder(LimitOrder storage order, int24 newTick, bool zeroForOne) internal view returns (bool) {
-        console.log("=== _shouldProcessOrder ===");
-        console.log("newTick:");
-        console.logInt(newTick);
-        console.log("zeroForOne:");
-        console.log(zeroForOne);
-        console.log("Order isToken0:");
-        console.log(order.isToken0);
-        console.log("bottomTick:");
-        console.logInt(order.bottomTick);
-        console.log("topTick:");
-        console.logInt(order.topTick);  
+        // console.log("=== _shouldProcessOrder ===");
+        // console.log("newTick:");
+        // console.logInt(newTick);
+        // console.log("zeroForOne:");
+        // console.log(zeroForOne);
+        // console.log("Order isToken0:");
+        // console.log(order.isToken0);
+        // console.log("bottomTick:");
+        // console.logInt(order.bottomTick);
+        // console.log("topTick:");
+        // console.logInt(order.topTick);  
         
         if (order.delta != BalanceDelta.wrap(0)) {
-            console.log("Order already executed");
+            // console.log("Order already executed");
             return false;
         }
 
         bool shouldProc = zeroForOne ? (!order.isToken0 && newTick < order.bottomTick) : (order.isToken0 && order.topTick <= newTick);
-        console.log("shouldProc:");
-        console.log(shouldProc);
+        // console.log("shouldProc:");
+        // console.log(shouldProc);
 
-        console.log("=== _shouldProcessOrder END ===");
+        // console.log("=== _shouldProcessOrder END ===");
         return shouldProc;
     }
 
